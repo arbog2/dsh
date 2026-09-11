@@ -1,0 +1,17 @@
+node_modules/
+dist/
+src-tauri/target/
+src-tauri/gen/
+runtime/.downloads/
+runtime/.prepared
+runtime/node/
+runtime/pnpm/
+runtime/git/
+runtime/harness-source/
+runtime/harness-runtime/
+runtime/*.zip
+src-tauri/binaries/*.exe
+/DeepSeekHarness/
+/DeepSeekHarness-portable-x64.zip
+first-launch.png
+*.log

@@ -1,0 +1,19 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "Default permissions for the DeepSeek Harness shell and web view.",
+  "windows": ["main", "harness"],
+  "permissions": [
+    "core:default",
+    "shell:allow-execute",
+    {
+      "identifier": "shell:allow-spawn",
+      "allow": [
+        {
+          "name": "binaries/node",
+          "sidecar": true
+        }
+      ]
+    }
+  ]
+}

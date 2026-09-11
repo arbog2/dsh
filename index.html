@@ -1,0 +1,121 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="theme-color" content="#f3f1ea" />
+    <title>DeepSeek Harness</title>
+  </head>
+  <body>
+    <div id="app">
+      <header class="topbar">
+        <div class="brand">
+          <div class="brand-mark" aria-hidden="true">DS</div>
+          <div>
+            <h1>DeepSeek Harness</h1>
+            <div class="service-line">
+              <span id="status-dot" class="status-dot neutral"></span>
+              <span id="status-label">Starting</span>
+              <span id="status-url" class="status-url"></span>
+            </div>
+          </div>
+        </div>
+        <div class="actions">
+          <button
+            id="drawer-button"
+            class="button secondary drawer-button"
+            type="button"
+            title="Status and log"
+            data-i18n-title="showDrawer"
+            disabled
+          >
+            <i data-lucide="panel-top" aria-hidden="true"></i>
+            <span data-i18n="showDrawer">Status and log</span>
+          </button>
+          <button
+            id="restart-button"
+            class="icon-button topbar-icon"
+            type="button"
+            title="Restart"
+            data-i18n-title="restart"
+            disabled
+          >
+            <i data-lucide="rotate-cw" aria-hidden="true"></i>
+            <span class="sr-only" data-i18n="restart">Restart</span>
+          </button>
+          <button
+            id="update-button"
+            class="icon-button topbar-icon"
+            type="button"
+            title="Update"
+            data-i18n-title="update"
+          >
+            <i data-lucide="refresh-cw" aria-hidden="true"></i>
+            <span class="sr-only" data-i18n="update">Update</span>
+          </button>
+          <button
+            id="language-button"
+            class="button secondary language-button"
+            type="button"
+            title="Switch to Chinese"
+            data-i18n-title="switchLanguage"
+          >
+            <i data-lucide="languages" aria-hidden="true"></i>
+            <span data-i18n="languageShort">中文</span>
+          </button>
+        </div>
+      </header>
+
+      <main>
+        <section class="status-panel" aria-live="polite">
+          <div class="status-copy">
+            <p class="eyebrow" data-i18n="service">Service</p>
+            <h2 id="status-message">Preparing the local runtime</h2>
+            <p id="status-detail">The first launch can take a moment while files are prepared.</p>
+          </div>
+          <div class="progress-block">
+            <div class="progress-meta">
+              <span id="progress-label">Initialization</span>
+              <span id="progress-value">0%</span>
+            </div>
+            <div
+              id="progress-track"
+              class="progress-track"
+              role="progressbar"
+              aria-label="Harness update progress"
+              data-i18n-aria-label="progressAria"
+              aria-valuemin="0"
+              aria-valuemax="100"
+              aria-valuenow="0"
+            >
+              <div id="progress-bar" class="progress-bar"></div>
+            </div>
+          </div>
+        </section>
+
+        <section class="activity-panel">
+          <div class="panel-header">
+            <div>
+              <p class="eyebrow" data-i18n="activity">Activity</p>
+              <h2 data-i18n="runtimeLog">Runtime log</h2>
+            </div>
+            <button
+              id="clear-log-button"
+              class="icon-button"
+              type="button"
+              title="Clear log"
+              data-i18n-title="clearLog"
+            >
+              <i data-lucide="trash-2" aria-hidden="true"></i>
+              <span class="sr-only" data-i18n="clearLog">Clear log</span>
+            </button>
+          </div>
+          <div id="log-output" class="log-output" role="log" aria-live="polite">
+            <div class="log-empty" data-i18n="waiting">Waiting for the service.</div>
+          </div>
+        </section>
+      </main>
+    </div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

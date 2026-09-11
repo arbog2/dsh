@@ -1,0 +1,24 @@
+{
+  "name": "deepseek-harness-tauri",
+  "private": true,
+  "version": "0.1.5",
+  "type": "module",
+  "packageManager": "pnpm@11.7.0",
+  "scripts": {
+    "dev": "vite --host 127.0.0.1",
+    "build:web": "tsc --noEmit && vite build",
+    "tauri": "tauri",
+    "prepare:runtime": "node scripts/prepare-runtime.mjs",
+    "package:portable": "node scripts/build-portable.mjs",
+    "check": "tsc --noEmit && cargo check --manifest-path src-tauri/Cargo.toml"
+  },
+  "dependencies": {
+    "@tauri-apps/api": "^2.8.0",
+    "lucide": "^0.468.0"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2.8.4",
+    "typescript": "^5.7.3",
+    "vite": "^6.1.0"
+  }
+}
