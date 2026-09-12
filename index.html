@@ -99,16 +99,28 @@
               <p class="eyebrow" data-i18n="activity">Activity</p>
               <h2 data-i18n="runtimeLog">Runtime log</h2>
             </div>
-            <button
-              id="clear-log-button"
-              class="icon-button"
-              type="button"
-              title="Clear log"
-              data-i18n-title="clearLog"
-            >
-              <i data-lucide="trash-2" aria-hidden="true"></i>
-              <span class="sr-only" data-i18n="clearLog">Clear log</span>
-            </button>
+            <div class="panel-actions">
+              <button
+                id="open-logs-button"
+                class="icon-button"
+                type="button"
+                title="Open log folder"
+                data-i18n-title="openLogs"
+              >
+                <i data-lucide="folder-open" aria-hidden="true"></i>
+                <span class="sr-only" data-i18n="openLogs">Open log folder</span>
+              </button>
+              <button
+                id="clear-log-button"
+                class="icon-button"
+                type="button"
+                title="Clear log"
+                data-i18n-title="clearLog"
+              >
+                <i data-lucide="trash-2" aria-hidden="true"></i>
+                <span class="sr-only" data-i18n="clearLog">Clear log</span>
+              </button>
+            </div>
           </div>
           <div id="log-output" class="log-output" role="log" aria-live="polite">
             <div class="log-empty" data-i18n="waiting">Waiting for the service.</div>

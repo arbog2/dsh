@@ -113,6 +113,13 @@ taskkill /PID <pid> /T /F
 
 控制页先完成事件监听注册，再请求当前状态。这样可以避免快速启动时错过状态事件。
 
+## 诊断日志
+
+桌面端将日志写入 `%APPDATA%\com.deepseek.harness.desktop\harness\logs`。
+`desktop.log` 记录启动、服务状态和错误；每次更新另外生成
+`update-YYYYMMDD-HHMMSS-mmm.log`。更新日志包含阶段、命令参数、工作目录、退出码和
+失败命令的 stdout/stderr 末尾内容，并保留最近 30 次。
+
 ## 中英文
 
 语言选择保存在 WebView 的 `localStorage`：

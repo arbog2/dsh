@@ -1,14 +1,17 @@
+use chrono::Local;
 use serde::Serialize;
 use std::{
+    collections::VecDeque,
     ffi::OsString,
-    fs,
+    fs::{self, File, OpenOptions},
+    io::Write,
     path::{Path, PathBuf},
     process::{Command, Stdio},
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
-        Mutex,
+        Arc, Mutex,
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 use tauri::{
     AppHandle, Emitter, Manager, PhysicalPosition, PhysicalSize, RunEvent, State, WebviewBuilder,
@@ -25,6 +28,13 @@ use tokio::{
 
 const TOP_BAR_HEIGHT: f64 = 64.0;
 const DRAWER_HEIGHT: f64 = 300.0;
+const UPDATE_LOG_RETENTION: usize = 30;
+const COMMAND_OUTPUT_TAIL_LINES: usize = 60;
+const MAX_UPDATE_LOG_BYTES: u64 = 32 * 1024 * 1024;
+const MAX_LOG_LINE_CHARS: usize = 16_384;
+const MAX_DESKTOP_LOG_BYTES: u64 = 8 * 1024 * 1024;
+const PNPM_MIRROR_REGISTRY: &str = "https://registry.npmmirror.com/";
+const NPM_OFFICIAL_REGISTRY: &str = "https://registry.npmjs.org/";
 
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -61,8 +71,29 @@ struct AppState {
     status: Mutex<HarnessStatus>,
     child: Mutex<Option<CommandChild>>,
     authenticated_url: Mutex<Option<String>>,
+    diagnostics: Mutex<Option<DiagnosticLogState>>,
     generation: AtomicU64,
     update_in_progress: AtomicBool,
+}
+
+struct DiagnosticLogState {
+    desktop: File,
+    desktop_bytes: u64,
+    desktop_truncated: bool,
+    update: Option<UpdateLogState>,
+}
+
+struct UpdateLogState {
+    file: File,
+    path: PathBuf,
+    started: Instant,
+    bytes_written: u64,
+    truncated: bool,
+}
+
+#[derive(Default)]
+struct CommandOutput {
+    lines: VecDeque<String>,
 }
 
 #[derive(Clone, Serialize)]
@@ -99,12 +130,23 @@ async fn restart_harness(app: AppHandle) -> Result<HarnessStatus, String> {
 }
 
 #[tauri::command]
-async fn update_harness(app: AppHandle, state: State<'_, AppState>) -> Result<HarnessStatus, String> {
+async fn update_harness(
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<HarnessStatus, String> {
     if state.update_in_progress.swap(true, Ordering::SeqCst) {
         return Err("An update is already in progress.".into());
     }
 
+    if let Err(error) = begin_update_log(&app) {
+        emit_log(
+            &app,
+            "warn",
+            format!("Could not create the update diagnostic log: {error}"),
+        );
+    }
     let result = perform_update(app.clone()).await;
+    finish_update_log(&app, result.as_ref());
     state.update_in_progress.store(false, Ordering::SeqCst);
 
     match result {
@@ -117,6 +159,28 @@ async fn update_harness(app: AppHandle, state: State<'_, AppState>) -> Result<Ha
             Err(error)
         }
     }
+}
+
+#[tauri::command]
+fn open_log_directory(app: AppHandle) -> Result<String, String> {
+    let directory = log_directory(&app)?;
+    fs::create_dir_all(&directory)
+        .map_err(|error| format!("failed to create {}: {error}", directory.display()))?;
+
+    #[cfg(target_os = "windows")]
+    let result = Command::new("explorer.exe").arg(&directory).spawn();
+    #[cfg(target_os = "macos")]
+    let result = Command::new("open").arg(&directory).spawn();
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let result = Command::new("xdg-open").arg(&directory).spawn();
+
+    result.map_err(|error| {
+        format!(
+            "failed to open log directory {}: {error}",
+            directory.display()
+        )
+    })?;
+    Ok(directory.to_string_lossy().to_string())
 }
 
 pub fn run() {
@@ -134,10 +198,24 @@ pub fn run() {
             open_harness,
             restart_harness,
             update_harness,
+            open_log_directory,
             set_drawer_open
         ])
         .setup(|app| {
             let handle = app.handle().clone();
+            if let Err(error) = initialize_diagnostics(&handle) {
+                eprintln!("failed to initialize diagnostic logging: {error}");
+            }
+            emit_log(
+                &handle,
+                "info",
+                format!(
+                    "DeepSeek Harness desktop {} starting on {}/{}",
+                    env!("CARGO_PKG_VERSION"),
+                    std::env::consts::OS,
+                    std::env::consts::ARCH
+                ),
+            );
             tauri::async_runtime::spawn(async move {
                 let init_handle = handle.clone();
                 let init_result =
@@ -213,19 +291,22 @@ async fn start_service(app: AppHandle) -> Result<HarnessStatus, String> {
     }
 
     let pnpm_home = resource_path(&app, "runtime/pnpm")?;
+    let runtime_entry_arg = normalize_path_for_command(&runtime_entry);
+    let source_dir_arg = normalize_path_for_command(&source_dir);
+    let pnpm_home_arg = normalize_path_for_command(&pnpm_home);
     let sidecar = app
         .shell()
         .sidecar("node")
         .map_err(|error| format!("failed to resolve bundled Node.js: {error}"))?
         .args([
-            runtime_entry.to_string_lossy().to_string(),
+            runtime_entry_arg,
             "web".into(),
             "--port".into(),
             port.to_string(),
             "--no-open".into(),
         ])
-        .current_dir(&source_dir)
-        .env("PNPM_HOME", pnpm_home.to_string_lossy().to_string());
+        .current_dir(Path::new(&source_dir_arg))
+        .env("PNPM_HOME", pnpm_home_arg);
 
     let (mut receiver, child) = sidecar
         .spawn()
@@ -378,7 +459,7 @@ async fn perform_update(app: AppHandle) -> Result<HarnessStatus, String> {
             "Installing dependencies",
             "Resolving the locked Harness workspace.",
         );
-        run_pnpm(
+        run_pnpm_with_registry_fallback(
             &app,
             &node,
             &pnpm,
@@ -430,7 +511,7 @@ async fn perform_update(app: AppHandle) -> Result<HarnessStatus, String> {
             "Creating a production-only dependency tree.",
         );
         remove_directory_if_exists(&next_runtime)?;
-        run_pnpm(
+        run_pnpm_with_registry_fallback(
             &app,
             &node,
             &pnpm,
@@ -447,7 +528,7 @@ async fn perform_update(app: AppHandle) -> Result<HarnessStatus, String> {
                 "--config.auto-install-peers=true".into(),
                 "--config.link-workspace-packages=true".into(),
                 "--config.ignore-scripts=true".into(),
-                next_runtime.to_string_lossy().to_string(),
+                normalize_path_for_command(&next_runtime),
             ],
             "pnpm deploy",
         )
@@ -457,9 +538,9 @@ async fn perform_update(app: AppHandle) -> Result<HarnessStatus, String> {
             &app,
             &node,
             vec![
-                repair_script.to_string_lossy().to_string(),
-                source_dir.to_string_lossy().to_string(),
-                next_runtime.to_string_lossy().to_string(),
+                normalize_path_for_command(&repair_script),
+                normalize_path_for_command(&source_dir),
+                normalize_path_for_command(&next_runtime),
             ],
             &source_dir,
             Vec::new(),
@@ -554,7 +635,7 @@ async fn prepare_deployed_runtime(
             vec![
                 "cnoke.cjs".into(),
                 "-P".into(),
-                koffi.to_string_lossy().to_string(),
+                normalize_path_for_command(&koffi),
                 "-D".into(),
                 "src/koffi".into(),
                 "--prebuild".into(),
@@ -721,21 +802,126 @@ async fn run_pnpm(
     args: Vec<String>,
     label: &str,
 ) -> Result<(), String> {
-    let mut command_args = Vec::with_capacity(args.len() + 1);
-    command_args.push(pnpm.to_string_lossy().to_string());
-    command_args.extend(args);
     run_command(
         app,
         node,
-        command_args,
+        pnpm_command_args(pnpm, args),
         cwd,
-        vec![(
-            "PNPM_HOME".into(),
-            pnpm_home.to_string_lossy().to_string(),
-        )],
+        vec![
+            (
+                "PNPM_HOME".into(),
+                normalize_path_for_command(pnpm_home),
+            ),
+            ("npm_config_registry".into(), PNPM_MIRROR_REGISTRY.into()),
+            (
+                "NPM_CONFIG_REGISTRY".into(),
+                PNPM_MIRROR_REGISTRY.into(),
+            ),
+        ],
         label,
     )
     .await
+}
+
+async fn run_pnpm_with_registry_fallback(
+    app: &AppHandle,
+    node: &Path,
+    pnpm: &Path,
+    cwd: &Path,
+    pnpm_home: &Path,
+    args: Vec<String>,
+    label: &str,
+) -> Result<(), String> {
+    match run_pnpm_with_registry(
+        app,
+        node,
+        pnpm,
+        cwd,
+        pnpm_home,
+        PNPM_MIRROR_REGISTRY,
+        args.clone(),
+        label,
+    )
+    .await
+    {
+        Ok(()) => Ok(()),
+        Err(mirror_error) => {
+            emit_log(
+                app,
+                "warn",
+                format!(
+                    "{label} failed through the preferred npm mirror; retrying with the official registry: {mirror_error}"
+                ),
+            );
+            run_pnpm_with_registry(
+                app,
+                node,
+                pnpm,
+                cwd,
+                pnpm_home,
+                NPM_OFFICIAL_REGISTRY,
+                args,
+                label,
+            )
+            .await
+            .map_err(|official_error| {
+                format!(
+                    "{label} failed through both npm registries.\n  mirror error: {mirror_error}\n  official error: {official_error}"
+                )
+            })
+        }
+    }
+}
+
+async fn run_pnpm_with_registry(
+    app: &AppHandle,
+    node: &Path,
+    pnpm: &Path,
+    cwd: &Path,
+    pnpm_home: &Path,
+    registry: &str,
+    args: Vec<String>,
+    label: &str,
+) -> Result<(), String> {
+    run_command(
+        app,
+        node,
+        pnpm_registry_command_args(pnpm, registry, args),
+        cwd,
+        vec![
+            (
+                "PNPM_HOME".into(),
+                normalize_path_for_command(pnpm_home),
+            ),
+            ("npm_config_registry".into(), registry.to_string()),
+            ("NPM_CONFIG_REGISTRY".into(), registry.to_string()),
+            ("npm_config_fetch_retries".into(), "3".into()),
+            ("npm_config_fetch_timeout".into(), "120000".into()),
+        ],
+        label,
+    )
+    .await
+}
+
+fn pnpm_command_args(pnpm: &Path, args: Vec<String>) -> Vec<String> {
+    let mut command_args = Vec::with_capacity(args.len() + 3);
+    command_args.push(normalize_path_for_command(pnpm));
+    // pnpm only consumes config flags before the subcommand. Putting these
+    // after `run` forwards them to the package script instead.
+    command_args.push("--config.confirmModulesPurge=false".into());
+    command_args.push("--config.verify-deps-before-run=false".into());
+    command_args.extend(args);
+    command_args
+}
+
+fn pnpm_registry_command_args(
+    pnpm: &Path,
+    registry: &str,
+    args: Vec<String>,
+) -> Vec<String> {
+    let mut command_args = pnpm_command_args(pnpm, args);
+    command_args.insert(3, format!("--registry={registry}"));
+    command_args
 }
 
 async fn run_command(
@@ -746,24 +932,41 @@ async fn run_command(
     environment: Vec<(OsString, String)>,
     label: &str,
 ) -> Result<(), String> {
+    // Tauri resource paths are verbatim on Windows (`\\?\D:\...`). pnpm
+    // miscomputes lifecycle paths such as npm_execpath for that form.
+    let program = normalize_windows_path(program);
+    let cwd = normalize_windows_path(cwd);
+    let command_line = format!(
+        "{} {}",
+        program.display(),
+        args.iter()
+            .map(|argument| quote_argument(argument))
+            .collect::<Vec<_>>()
+            .join(" ")
+    );
+    let environment_text = environment
+        .iter()
+        .map(|(key, value)| format!("{}={}", key.to_string_lossy(), quote_argument(value)))
+        .collect::<Vec<_>>()
+        .join(", ");
     emit_log(
         app,
         "info",
         format!(
-            "{}: {} {}",
-            label,
-            program.display(),
-            args.iter()
-                .map(|argument| quote_argument(argument))
-                .collect::<Vec<_>>()
-                .join(" ")
+            "Starting {label}: {command_line}\n  cwd: {}\n  env: {}",
+            cwd.display(),
+            if environment_text.is_empty() {
+                "(inherited)"
+            } else {
+                &environment_text
+            }
         ),
     );
 
-    let mut command = AsyncCommand::new(program);
+    let mut command = AsyncCommand::new(&program);
     command
         .args(args)
-        .current_dir(cwd)
+        .current_dir(&cwd)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -778,48 +981,95 @@ async fn run_command(
         command.creation_flags(CREATE_NO_WINDOW);
     }
 
-    let mut child = command
-        .spawn()
-        .map_err(|error| format!("failed to start {label}: {error}"))?;
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(error) => {
+            let message = format!("failed to start {label}: {error}");
+            write_update_log(app, "error", format!("{message}\n  command: {command_line}"));
+            return Err(message);
+        }
+    };
     let stdout = child
         .stdout
         .take()
-        .ok_or_else(|| format!("failed to capture stdout for {label}"))?;
+        .ok_or_else(|| {
+            let message = format!("failed to capture stdout for {label}");
+            write_update_log(app, "error", &message);
+            message
+        })?;
     let stderr = child
         .stderr
         .take()
-        .ok_or_else(|| format!("failed to capture stderr for {label}"))?;
+        .ok_or_else(|| {
+            let message = format!("failed to capture stderr for {label}");
+            write_update_log(app, "error", &message);
+            message
+        })?;
 
     let stdout_app = app.clone();
+    let stdout_output = Arc::new(Mutex::new(CommandOutput::default()));
+    let stdout_output_task = stdout_output.clone();
     let stdout_task = tauri::async_runtime::spawn(async move {
         let mut lines = TokioBufReader::new(stdout).lines();
         while let Ok(Some(line)) = lines.next_line().await {
+            let line = sanitize_log_line(line);
+            push_command_output(&stdout_output_task, &line);
             emit_log(&stdout_app, "info", line);
         }
     });
     let stderr_app = app.clone();
+    let stderr_output = Arc::new(Mutex::new(CommandOutput::default()));
+    let stderr_output_task = stderr_output.clone();
     let stderr_task = tauri::async_runtime::spawn(async move {
         let mut lines = TokioBufReader::new(stderr).lines();
         while let Ok(Some(line)) = lines.next_line().await {
+            let line = sanitize_log_line(line);
+            push_command_output(&stderr_output_task, &line);
             emit_log(&stderr_app, "warn", line);
         }
     });
 
-    let status = child
-        .wait()
-        .await
-        .map_err(|error| format!("failed while waiting for {label}: {error}"))?;
+    let status = match child.wait().await {
+        Ok(status) => status,
+        Err(error) => {
+            let message = format!("failed while waiting for {label}: {error}");
+            write_update_log(app, "error", &message);
+            return Err(message);
+        }
+    };
     let _ = stdout_task.await;
     let _ = stderr_task.await;
     if status.success() {
+        write_update_log(
+            app,
+            "info",
+            format!(
+                "Finished {label} successfully\n  command: {command_line}\n  exitCode: {}",
+                status.code().map_or("unknown".into(), |code| code.to_string())
+            ),
+        );
         Ok(())
     } else {
-        Err(format!(
+        let message = format!(
             "{label} failed with {}",
             status
                 .code()
                 .map_or_else(|| "an unknown status".to_string(), |code| format!("exit code {code}"))
-        ))
+        );
+        let stdout_tail = command_output_text(&stdout_output);
+        let stderr_tail = command_output_text(&stderr_output);
+        write_update_log(
+            app,
+            "error",
+            format!(
+                "{message}\n  command: {command_line}\n  cwd: {}\n  exitCode: {}\n  stdout tail:\n{}\n  stderr tail:\n{}",
+                cwd.display(),
+                status.code().map_or("unknown".into(), |code| code.to_string()),
+                indent_log_block(&stdout_tail),
+                indent_log_block(&stderr_tail),
+            ),
+        );
+        Err(message)
     }
 }
 
@@ -1111,6 +1361,386 @@ fn writable_runtime_dir(app: &AppHandle) -> Result<PathBuf, String> {
     writable_harness_root(app).map(|directory| directory.join("runtime"))
 }
 
+fn log_directory(app: &AppHandle) -> Result<PathBuf, String> {
+    writable_harness_root(app).map(|directory| directory.join("logs"))
+}
+
+fn initialize_diagnostics(app: &AppHandle) -> Result<(), String> {
+    let directory = log_directory(app)?;
+    fs::create_dir_all(&directory)
+        .map_err(|error| format!("failed to create {}: {error}", directory.display()))?;
+    let desktop_path = directory.join("desktop.log");
+    rotate_log_if_needed(&desktop_path, MAX_DESKTOP_LOG_BYTES)?;
+    let desktop_size = fs::metadata(&desktop_path).map_or(0, |metadata| metadata.len());
+    let desktop = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&desktop_path)
+        .map_err(|error| format!("failed to open {}: {error}", desktop_path.display()))?;
+
+    let state = app.state::<AppState>();
+    let mut diagnostics = state
+        .diagnostics
+        .lock()
+        .expect("diagnostic log lock poisoned");
+    *diagnostics = Some(DiagnosticLogState {
+        desktop,
+        desktop_bytes: desktop_size,
+        desktop_truncated: false,
+        update: None,
+    });
+    Ok(())
+}
+
+fn begin_update_log(app: &AppHandle) -> Result<(), String> {
+    let directory = log_directory(app)?;
+    fs::create_dir_all(&directory)
+        .map_err(|error| format!("failed to create {}: {error}", directory.display()))?;
+    cleanup_old_update_logs(&directory)?;
+
+    let path = directory.join(format!(
+        "update-{}.log",
+        Local::now().format("%Y%m%d-%H%M%S-%3f")
+    ));
+    let file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .write(true)
+        .open(&path)
+        .map_err(|error| format!("failed to create {}: {error}", path.display()))?;
+
+    let state = app.state::<AppState>();
+    let mut diagnostics = state
+        .diagnostics
+        .lock()
+        .expect("diagnostic log lock poisoned");
+    if let Some(state) = diagnostics.as_mut() {
+        if state.update.is_some() {
+            return Err("an update diagnostic log is already active".into());
+        }
+        state.update = Some(UpdateLogState {
+            file,
+            path: path.clone(),
+            started: Instant::now(),
+            bytes_written: 0,
+            truncated: false,
+        });
+    } else {
+        return Err("diagnostic logging is not initialized".into());
+    }
+    drop(diagnostics);
+
+    write_update_log(
+        app,
+        "info",
+        format!(
+            "DeepSeek Harness update started\n  version: {}\n  os: {}\n  arch: {}\n  pid: {}\n  source: {}\n  runtime: {}\n",
+            env!("CARGO_PKG_VERSION"),
+            std::env::consts::OS,
+            std::env::consts::ARCH,
+            std::process::id(),
+            writable_source_dir(app)
+                .map_or_else(|error| error, |path| path.display().to_string()),
+            writable_runtime_dir(app)
+                .map_or_else(|error| error, |path| path.display().to_string()),
+        ),
+    );
+    write_environment_snapshot(app);
+    Ok(())
+}
+
+fn finish_update_log(app: &AppHandle, result: Result<&HarnessStatus, &String>) {
+    let (level, message) = match result {
+        Ok(status) if status.progress_label == "Update failed" => (
+            "error",
+            format!(
+                "DeepSeek Harness update failed\n  message: {}\n  detail: {}",
+                status.message, status.detail
+            ),
+        ),
+        Ok(status) => (
+            "info",
+            format!(
+                "DeepSeek Harness update completed\n  message: {}\n  detail: {}",
+                status.message, status.detail
+            ),
+        ),
+        Err(error) => (
+            "error",
+            format!("DeepSeek Harness update failed\n  error: {error}"),
+        ),
+    };
+    write_update_log(app, level, message);
+
+    let state = app.state::<AppState>();
+    let update = {
+        let mut diagnostics = state
+            .diagnostics
+            .lock()
+            .expect("diagnostic log lock poisoned");
+        diagnostics
+        .as_mut()
+        .and_then(|state| state.update.take())
+    };
+    if let Some(update) = update {
+        emit_log(
+            app,
+            "info",
+            format!(
+                "Update diagnostic log: {} ({} ms, {} bytes{})",
+                update.path.display(),
+                update.started.elapsed().as_millis(),
+                update.bytes_written,
+                if update.truncated {
+                    ", truncated at size limit"
+                } else {
+                    ""
+                }
+            ),
+        );
+    }
+}
+
+fn write_environment_snapshot(app: &AppHandle) {
+    let mut lines = Vec::new();
+    for key in [
+        "APPDATA",
+        "LOCALAPPDATA",
+        "TEMP",
+        "TMP",
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "ALL_PROXY",
+        "NO_PROXY",
+    ] {
+        let value = std::env::var(key).unwrap_or_else(|_| "(not set)".into());
+        lines.push(format!(
+            "  {key}={}",
+            if key.ends_with("PROXY") {
+                redact_url_password(&value)
+            } else {
+                value
+            }
+        ));
+    }
+    write_update_log(app, "info", format!("Environment:\n{}", lines.join("\n")));
+}
+
+fn write_update_log(app: &AppHandle, level: &'static str, line: impl AsRef<str>) {
+    let path = update_log_path(app);
+    write_log_path(app.clone(), path.as_deref(), level, line.as_ref().to_string());
+}
+
+fn update_log_path(app: &AppHandle) -> Option<PathBuf> {
+    let state = app.state::<AppState>();
+    let diagnostics = state
+        .diagnostics
+        .lock()
+        .expect("diagnostic log lock poisoned");
+    diagnostics
+        .as_ref()
+        .and_then(|state| state.update.as_ref())
+        .map(|update| update.path.clone())
+}
+
+fn write_log_path(
+    app: AppHandle,
+    update_path: Option<&Path>,
+    level: &'static str,
+    message: String,
+) {
+    let timestamp = Local::now().format("%Y-%m-%d %H:%M:%S%.3f%:z");
+    let entry = format!(
+        "{timestamp} [{level}] {}\n",
+        redact_secrets(&message).trim_end_matches('\n')
+    );
+    let app_state = app.state::<AppState>();
+    let mut diagnostics = app_state
+        .diagnostics
+        .lock()
+        .expect("diagnostic log lock poisoned");
+    let Some(state) = diagnostics.as_mut() else {
+        return;
+    };
+
+    write_bounded_file(
+        &mut state.desktop,
+        &mut state.desktop_bytes,
+        &mut state.desktop_truncated,
+        &entry,
+        MAX_DESKTOP_LOG_BYTES,
+    );
+    if let Some(update_path) = update_path {
+        if let Some(update) = state.update.as_mut() {
+            if update.path == update_path {
+                write_bounded_file(
+                    &mut update.file,
+                    &mut update.bytes_written,
+                    &mut update.truncated,
+                    &entry,
+                    MAX_UPDATE_LOG_BYTES,
+                );
+            }
+        }
+    }
+}
+
+fn write_bounded_file(
+    file: &mut File,
+    bytes_written: &mut u64,
+    truncated: &mut bool,
+    entry: &str,
+    limit: u64,
+) {
+    if *bytes_written >= limit {
+        if !*truncated {
+            let notice = format!(
+                "{} [warn] Log size limit reached; further output is omitted.\n",
+                Local::now().format("%Y-%m-%d %H:%M:%S%.3f%:z")
+            );
+            let _ = file.write_all(notice.as_bytes());
+            let _ = file.flush();
+            *truncated = true;
+        }
+        return;
+    }
+    let remaining = limit.saturating_sub(*bytes_written);
+    let bytes = entry.as_bytes();
+    let accepted = if bytes.len() as u64 > remaining {
+        let mut end = remaining as usize;
+        while end > 0 && !entry.is_char_boundary(end) {
+            end -= 1;
+        }
+        &bytes[..end]
+    } else {
+        bytes
+    };
+    if file.write_all(accepted).is_ok() {
+        *bytes_written += accepted.len() as u64;
+    }
+    let _ = file.flush();
+}
+
+fn rotate_log_if_needed(path: &Path, limit: u64) -> Result<(), String> {
+    let Ok(metadata) = fs::metadata(path) else {
+        return Ok(());
+    };
+    if metadata.len() <= limit {
+        return Ok(());
+    }
+    let previous = path.with_extension("previous.log");
+    if previous.exists() {
+        fs::remove_file(&previous).map_err(|error| {
+            format!("failed to remove {}: {error}", previous.display())
+        })?;
+    }
+    fs::rename(path, &previous)
+        .map_err(|error| format!("failed to rotate {}: {error}", path.display()))
+}
+
+fn cleanup_old_update_logs(directory: &Path) -> Result<(), String> {
+    let mut logs = Vec::new();
+    for entry in fs::read_dir(directory)
+        .map_err(|error| format!("failed to read {}: {error}", directory.display()))?
+    {
+        let entry = entry.map_err(|error| format!("failed to inspect log entry: {error}"))?;
+        let path = entry.path();
+        let is_update_log = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with("update-") && name.ends_with(".log"));
+        if !is_update_log {
+            continue;
+        }
+        let modified = entry
+            .metadata()
+            .and_then(|metadata| metadata.modified())
+            .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+        logs.push((modified, path));
+    }
+    logs.sort_by_key(|(modified, _)| *modified);
+    while logs.len() >= UPDATE_LOG_RETENTION {
+        let (_, path) = logs.remove(0);
+        let _ = fs::remove_file(path);
+    }
+    Ok(())
+}
+
+fn sanitize_log_line(line: String) -> String {
+    let mut output = String::with_capacity(line.len().min(MAX_LOG_LINE_CHARS));
+    for character in line.chars().take(MAX_LOG_LINE_CHARS) {
+        if character == '\0' {
+            continue;
+        }
+        output.push(character);
+    }
+    if line.chars().count() > MAX_LOG_LINE_CHARS {
+        output.push_str("... [line truncated]");
+    }
+    output
+}
+
+fn redact_url_password(value: &str) -> String {
+    let Ok(mut url) = url::Url::parse(value) else {
+        return value.to_string();
+    };
+    if url.password().is_some() {
+        let _ = url.set_password(Some("REDACTED"));
+    }
+    url.to_string()
+}
+
+fn redact_secrets(value: &str) -> String {
+    const KEYS: [&str; 3] = ["token=", "access_token=", "auth="];
+    let mut output = String::with_capacity(value.len());
+    let mut remaining = value;
+
+    while let Some((index, key)) = KEYS
+        .iter()
+        .filter_map(|key| remaining.find(key).map(|index| (index, *key)))
+        .min_by_key(|(index, _)| *index)
+    {
+        output.push_str(&remaining[..index + key.len()]);
+        output.push_str("[redacted]");
+        remaining = &remaining[index + key.len()..];
+        let end = remaining
+            .find(|character: char| {
+                character.is_whitespace()
+                    || matches!(character, '&' | '"' | '\'' | ')' | ']' | '}' | ',')
+            })
+            .unwrap_or(remaining.len());
+        remaining = &remaining[end..];
+    }
+
+    output.push_str(remaining);
+    output
+}
+
+fn push_command_output(output: &Arc<Mutex<CommandOutput>>, line: &str) {
+    let mut output = output.lock().expect("command output lock poisoned");
+    output.lines.push_back(line.to_string());
+    while output.lines.len() > COMMAND_OUTPUT_TAIL_LINES {
+        output.lines.pop_front();
+    }
+}
+
+fn command_output_text(output: &Arc<Mutex<CommandOutput>>) -> String {
+    let output = output.lock().expect("command output lock poisoned");
+    if output.lines.is_empty() {
+        "(empty)".into()
+    } else {
+        output.lines.iter().cloned().collect::<Vec<_>>().join("\n")
+    }
+}
+
+fn indent_log_block(value: &str) -> String {
+    value
+        .lines()
+        .map(|line| format!("    {line}"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 fn current_status(app: &AppHandle) -> HarnessStatus {
     app.state::<AppState>()
         .status
@@ -1141,6 +1771,11 @@ fn set_phase(
         .state::<AppState>()
         .update_in_progress
         .load(Ordering::SeqCst);
+    emit_log(
+        app,
+        "info",
+        format!("{label} ({progress}%): {detail}"),
+    );
     publish_status(
         app,
         HarnessStatus {
@@ -1159,6 +1794,11 @@ fn set_phase(
 
 fn set_update_progress(app: &AppHandle, progress: u8, label: &str, detail: &str) {
     let current = current_status(app);
+    emit_log(
+        app,
+        "info",
+        format!("{label} ({progress}%): {detail}"),
+    );
     publish_status(
         app,
         HarnessStatus {
@@ -1197,11 +1837,14 @@ fn set_error(app: &AppHandle, detail: &str, label: &str) {
 }
 
 fn emit_log(app: &AppHandle, level: &'static str, line: impl Into<String>) {
+    let line = line.into();
+    let update_path = update_log_path(app);
+    write_log_path(app.clone(), update_path.as_deref(), level, line.clone());
     let _ = app.emit(
         "harness-log",
         LogEvent {
             level,
-            line: line.into(),
+            line,
         },
     );
 }
@@ -1214,13 +1857,39 @@ fn quote_argument(argument: &str) -> String {
     }
 }
 
+#[cfg(windows)]
+fn normalize_windows_path(path: &Path) -> PathBuf {
+    let value = path.to_string_lossy();
+    let Some(stripped) = value.strip_prefix(r"\\?\") else {
+        return path.to_path_buf();
+    };
+    if stripped.starts_with(r"UNC\") {
+        return PathBuf::from(format!(r"\\{}", &stripped[4..]));
+    }
+    PathBuf::from(stripped)
+}
+
+#[cfg(not(windows))]
+fn normalize_windows_path(path: &Path) -> PathBuf {
+    path.to_path_buf()
+}
+
+fn normalize_path_for_command(path: &Path) -> String {
+    normalize_windows_path(path).to_string_lossy().to_string()
+}
+
 fn strings<const N: usize>(values: [&str; N]) -> Vec<String> {
     values.into_iter().map(str::to_string).collect()
 }
 
 #[cfg(test)]
 mod tests {
-    use super::extract_authenticated_url;
+    use super::{
+        extract_authenticated_url, normalize_path_for_command, normalize_windows_path,
+        pnpm_command_args, pnpm_registry_command_args, redact_secrets, redact_url_password,
+        sanitize_log_line, MAX_LOG_LINE_CHARS,
+    };
+    use std::path::Path;
 
     #[test]
     fn extracts_harness_launch_url() {
@@ -1240,6 +1909,90 @@ mod tests {
         assert_eq!(
             extract_authenticated_url("http://127.0.0.1:39082/?token=abc", 39081),
             None
+        );
+    }
+
+    #[test]
+    fn redacts_tokens_from_log_output() {
+        assert_eq!(
+            redact_secrets("http://127.0.0.1:39082/?token=abc_DEF-123&view=main"),
+            "http://127.0.0.1:39082/?token=[redacted]&view=main"
+        );
+        assert_eq!(
+            redact_secrets("access_token=secret-value Authorization: Bearer hidden"),
+            "access_token=[redacted] Authorization: Bearer hidden"
+        );
+    }
+
+    #[test]
+    fn redacts_proxy_passwords() {
+        assert_eq!(
+            redact_url_password("http://user:secret@127.0.0.1:8080"),
+            "http://user:REDACTED@127.0.0.1:8080/"
+        );
+    }
+
+    #[test]
+    fn limits_oversized_log_lines() {
+        let line = "x".repeat(MAX_LOG_LINE_CHARS + 10);
+        let sanitized = sanitize_log_line(line);
+        assert!(sanitized.ends_with("... [line truncated]"));
+        assert!(sanitized.len() > MAX_LOG_LINE_CHARS);
+    }
+
+    #[test]
+    fn places_pnpm_config_before_the_subcommand() {
+        assert_eq!(
+            pnpm_command_args(
+                Path::new("pnpm.cjs"),
+                vec!["run".into(), "build".into()],
+            ),
+            vec![
+                "pnpm.cjs",
+                "--config.confirmModulesPurge=false",
+                "--config.verify-deps-before-run=false",
+                "run",
+                "build",
+            ]
+        );
+    }
+
+    #[test]
+    fn only_adds_registry_to_dependency_commands() {
+        assert_eq!(
+            pnpm_registry_command_args(
+                Path::new("pnpm.cjs"),
+                "https://registry.npmmirror.com/",
+                vec!["install".into(), "--frozen-lockfile".into()],
+            ),
+            vec![
+                "pnpm.cjs",
+                "--config.confirmModulesPurge=false",
+                "--config.verify-deps-before-run=false",
+                "--registry=https://registry.npmmirror.com/",
+                "install",
+                "--frozen-lockfile",
+            ]
+        );
+    }
+
+    #[test]
+    fn removes_windows_verbatim_prefixes() {
+        assert_eq!(
+            normalize_windows_path(Path::new(r"\\?\D:\code\harness\node.exe")),
+            Path::new(r"D:\code\harness\node.exe")
+        );
+        assert_eq!(
+            normalize_windows_path(Path::new(r"\\?\UNC\server\share\node.exe")),
+            Path::new(r"\\server\share\node.exe")
+        );
+    }
+
+    #[test]
+    fn normalizes_explicit_path_arguments_only() {
+        assert_eq!(
+            normalize_path_for_command(Path::new(r"\\?\D:\portable\node.exe")),
+            r"D:\portable\node.exe"
         );
     }
 }

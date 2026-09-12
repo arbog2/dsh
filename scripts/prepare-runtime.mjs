@@ -26,6 +26,8 @@ const gitUrl =
   `MinGit-${minGitVersion}-64-bit.zip`;
 const harnessUrl =
   "https://codeload.github.com/deepseek-ai/deepseek-harness/zip/refs/heads/master";
+const pnpmRegistry = "https://registry.npmmirror.com";
+const officialRegistry = "https://registry.npmjs.org";
 
 mkdirSync(downloads, { recursive: true });
 
@@ -201,7 +203,8 @@ async function buildHarnessRuntime() {
         pnpmCjs,
         "install",
         "--frozen-lockfile",
-        "--registry=https://registry.npmmirror.com",
+        "--config.confirmModulesPurge=false",
+        `--registry=${pnpmRegistry}`,
       ],
       sourceDir,
     );
@@ -214,7 +217,8 @@ async function buildHarnessRuntime() {
         pnpmCjs,
         "install",
         "--frozen-lockfile",
-        "--registry=https://registry.npmmirror.com",
+        "--config.confirmModulesPurge=false",
+        `--registry=${pnpmRegistry}`,
       ],
       sourceDir,
     );
@@ -237,7 +241,8 @@ async function buildHarnessRuntime() {
       "--config.auto-install-peers=true",
       "--config.link-workspace-packages=true",
       "--config.ignore-scripts=true",
-      "--registry=https://registry.npmmirror.com",
+      "--config.confirmModulesPurge=false",
+      `--registry=${pnpmRegistry}`,
       targetDir,
     ],
     sourceDir,
@@ -418,8 +423,8 @@ function run(command, args, cwd, capture = false) {
       ...process.env,
       CI: "1",
       COREPACK_ENABLE_DOWNLOAD_PROMPT: "0",
-      npm_config_registry: process.env.npm_config_registry ?? "https://registry.npmmirror.com",
-      NPM_CONFIG_REGISTRY: process.env.NPM_CONFIG_REGISTRY ?? "https://registry.npmmirror.com",
+      npm_config_registry: process.env.npm_config_registry ?? pnpmRegistry,
+      NPM_CONFIG_REGISTRY: process.env.NPM_CONFIG_REGISTRY ?? pnpmRegistry,
       npm_config_fetch_retries: "3",
       npm_config_fetch_timeout: "120000",
     },

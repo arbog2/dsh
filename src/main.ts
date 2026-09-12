@@ -1,6 +1,14 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { createIcons, Languages, PanelTop, RefreshCw, RotateCw, Trash2 } from "lucide";
+import {
+  createIcons,
+  FolderOpen,
+  Languages,
+  PanelTop,
+  RefreshCw,
+  RotateCw,
+  Trash2,
+} from "lucide";
 import "./styles.css";
 
 type Language = "en" | "zh";
@@ -34,6 +42,7 @@ const translations: Record<Language, Record<string, string>> = {
     service: "Service",
     activity: "Activity",
     runtimeLog: "Runtime log",
+    openLogs: "Open log folder",
     clearLog: "Clear log",
     waiting: "Waiting for the service.",
     logCleared: "Log cleared.",
@@ -57,6 +66,7 @@ const translations: Record<Language, Record<string, string>> = {
     service: "服务",
     activity: "活动",
     runtimeLog: "运行日志",
+    openLogs: "打开日志目录",
     clearLog: "清空日志",
     waiting: "等待服务启动。",
     logCleared: "日志已清空。",
@@ -137,6 +147,7 @@ const elements = {
   restartButton: requiredButton("restart-button"),
   updateButton: requiredButton("update-button"),
   languageButton: requiredButton("language-button"),
+  openLogsButton: requiredButton("open-logs-button"),
   clearLogButton: requiredButton("clear-log-button"),
 };
 
@@ -158,7 +169,7 @@ let currentStatus: HarnessStatus = {
 };
 
 createIcons({
-  icons: { Languages, PanelTop, RefreshCw, RotateCw, Trash2 },
+  icons: { FolderOpen, Languages, PanelTop, RefreshCw, RotateCw, Trash2 },
   attrs: { "stroke-width": "1.8" },
 });
 
@@ -179,6 +190,12 @@ elements.updateButton.addEventListener("click", () => {
 elements.languageButton.addEventListener("click", () => {
   const nextLanguage: Language = language === "zh" ? "en" : "zh";
   setLanguage(nextLanguage);
+});
+
+elements.openLogsButton.addEventListener("click", () => {
+  void invoke<string>("open_log_directory").catch((error: unknown) => {
+    renderError(error);
+  });
 });
 
 elements.clearLogButton.addEventListener("click", () => {
