@@ -123,3 +123,14 @@ deepseek-harness-language=en|zh
 
 首次没有保存值时，根据系统语言决定。动态状态和常见日志在显示前通过前端词典
 转换。
+## 单实例保护
+
+应用通过 Tauri single-instance 插件持有进程级单实例锁。
+
+第二次启动 `DeepSeekHarness.exe` 时：
+
+1. 新进程不会执行初始化或更新。
+2. 新进程激活并聚焦已有主窗口。
+3. 新进程随后退出。
+
+该保护避免两个实例同时原子替换 `source`、`.git`、`apps` 和 `runtime` 目录。

@@ -100,8 +100,8 @@ pnpm tauri build
 会生成：
 
 ```text
-src-tauri\target\release\bundle\nsis\DeepSeek Harness_0.1.5_x64-setup.exe
-src-tauri\target\release\bundle\msi\DeepSeek Harness_0.1.5_x64_en-US.msi
+src-tauri\target\release\bundle\nsis\DeepSeek Harness_0.1.6_x64-setup.exe
+src-tauri\target\release\bundle\msi\DeepSeek Harness_0.1.6_x64_en-US.msi
 ```
 
 当前主要发布目标是免安装便携包。
@@ -118,6 +118,7 @@ src-tauri\target\release\bundle\msi\DeepSeek Harness_0.1.5_x64_en-US.msi
 - 更新成功后 Harness 能重新启动。
 - 关闭窗口后 Node.js 进程树已清理。
 - ZIP 可以在另一个目录解压并运行。
+- 重复启动 exe 时第二个实例会退出并聚焦已有窗口。
 - Release 页面记录 ZIP 的 SHA-256。
 
 ## 发布资产

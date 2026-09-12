@@ -1,6 +1,12 @@
-# DSH Desktop v0.1.5
+# DSH Desktop v0.1.6
 
-首个公开便携版发布。
+单实例与并发更新修复版本。
+
+## 修复
+
+- 增加进程级单实例锁。重复启动 `DeepSeekHarness.exe` 时只聚焦已有窗口。
+- 防止两个实例并发初始化或更新 Harness 源码目录。
+- 修复重复实例同时修改 `source`、`.git`、`apps` 和 `runtime` 时触发 `pnpm run build` 失败的问题。
 
 ## 主要功能
 
@@ -35,5 +41,5 @@ DeepSeekHarness-portable-x64.zip
 ## SHA-256
 
 ```text
-635350192333B60012F80A121ADD831410BEC04943FFD14C764B142E887BD26F
+B9C6E86073BF4174B245497144D29217DF842199866F4B9A84C29CED2894C510
 ```
