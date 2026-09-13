@@ -328,7 +328,7 @@ async fn start_service(app: AppHandle) -> Result<HarnessStatus, String> {
         while let Some(event) = receiver.recv().await {
             match event {
                 CommandEvent::Stdout(line) => {
-                    let line = String::from_utf8_lossy(&line).trim_end().to_string();
+                    let line = sanitize_log_line(String::from_utf8_lossy(&line).trim_end());
                     if let Some(authenticated_url) = extract_authenticated_url(&line, port) {
                         *log_handle
                             .state::<AppState>()
@@ -347,7 +347,7 @@ async fn start_service(app: AppHandle) -> Result<HarnessStatus, String> {
                     emit_log(
                         &log_handle,
                         "warn",
-                        String::from_utf8_lossy(&line).trim_end().to_string(),
+                        sanitize_log_line(String::from_utf8_lossy(&line).trim_end()),
                     );
                 }
                 CommandEvent::Error(error) => {
@@ -971,6 +971,10 @@ async fn run_command(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .env("CI", "1")
+        // pnpm, tsdown, rolldown, and git all suppress color when NO_COLOR is
+        // set; without it they emit ANSI escapes that end up in the log files
+        // and the status drawer, where nothing renders them.
+        .env("NO_COLOR", "1")
         .env("COREPACK_ENABLE_DOWNLOAD_PROMPT", "0");
     for (key, value) in environment {
         command.env(key, value);
@@ -1012,9 +1016,11 @@ async fn run_command(
     let stdout_task = tauri::async_runtime::spawn(async move {
         let mut lines = TokioBufReader::new(stdout).lines();
         while let Ok(Some(line)) = lines.next_line().await {
-            let line = sanitize_log_line(line);
-            push_command_output(&stdout_output_task, &line);
-            emit_log(&stdout_app, "info", line);
+            for frame in progress_frames(&line) {
+                let frame = sanitize_log_line(frame);
+                push_command_output(&stdout_output_task, &frame);
+                emit_log(&stdout_app, "info", frame);
+            }
         }
     });
     let stderr_app = app.clone();
@@ -1023,9 +1029,11 @@ async fn run_command(
     let stderr_task = tauri::async_runtime::spawn(async move {
         let mut lines = TokioBufReader::new(stderr).lines();
         while let Ok(Some(line)) = lines.next_line().await {
-            let line = sanitize_log_line(line);
-            push_command_output(&stderr_output_task, &line);
-            emit_log(&stderr_app, "warn", line);
+            for frame in progress_frames(&line) {
+                let frame = sanitize_log_line(frame);
+                push_command_output(&stderr_output_task, &frame);
+                emit_log(&stderr_app, "warn", frame);
+            }
         }
     });
 
@@ -1666,7 +1674,8 @@ fn cleanup_old_update_logs(directory: &Path) -> Result<(), String> {
     Ok(())
 }
 
-fn sanitize_log_line(line: String) -> String {
+fn sanitize_log_line(line: &str) -> String {
+    let line = strip_ansi_escapes(line);
     let mut output = String::with_capacity(line.len().min(MAX_LOG_LINE_CHARS));
     for character in line.chars().take(MAX_LOG_LINE_CHARS) {
         if character == '\0' {
@@ -1676,6 +1685,69 @@ fn sanitize_log_line(line: String) -> String {
     }
     if line.chars().count() > MAX_LOG_LINE_CHARS {
         output.push_str("... [line truncated]");
+    }
+    output
+}
+
+/// Split one captured child-process line into the frames a terminal would have
+/// painted in place.
+///
+/// Tools that render progress (`git`, npm) separate frames with a bare carriage
+/// return instead of a newline, so a reader that only splits on `\n` collects a
+/// whole progress bar into one entry.
+fn progress_frames(line: &str) -> impl Iterator<Item = &str> {
+    line.split('\r')
+        .map(str::trim_end)
+        .filter(|frame| !frame.is_empty())
+}
+
+/// Remove ANSI/VT escape sequences from captured child-process output.
+///
+/// Build tools colorize their output whenever they believe a terminal is
+/// attached, and those escape bytes otherwise reach the log files and the status
+/// drawer verbatim as `[34m`-style noise. Every consumer renders plain text, so
+/// the sequences are dropped here.
+fn strip_ansi_escapes(value: &str) -> String {
+    let mut output = String::with_capacity(value.len());
+    let mut characters = value.chars().peekable();
+    while let Some(character) = characters.next() {
+        match character {
+            // CSI: ESC [ <parameters and intermediates> <final byte @..~>
+            '\u{1b}' => match characters.peek() {
+                Some('[') => {
+                    characters.next();
+                    for next in characters.by_ref() {
+                        if ('\u{40}'..='\u{7e}').contains(&next) {
+                            break;
+                        }
+                    }
+                }
+                // OSC: ESC ] <text> terminated by BEL or ESC backslash
+                Some(']') => {
+                    characters.next();
+                    while let Some(next) = characters.next() {
+                        if next == '\u{7}' {
+                            break;
+                        }
+                        if next == '\u{1b}' {
+                            if characters.peek() == Some(&'\\') {
+                                characters.next();
+                            }
+                            break;
+                        }
+                    }
+                }
+                // Two-character escape such as ESC 7 or ESC =.
+                Some(_) => {
+                    characters.next();
+                }
+                None => {}
+            },
+            // Tabs stay meaningful; every other control character is noise.
+            '\t' => output.push(character),
+            control if control.is_control() => {}
+            _ => output.push(character),
+        }
     }
     output
 }
@@ -1886,8 +1958,8 @@ fn strings<const N: usize>(values: [&str; N]) -> Vec<String> {
 mod tests {
     use super::{
         extract_authenticated_url, normalize_path_for_command, normalize_windows_path,
-        pnpm_command_args, pnpm_registry_command_args, redact_secrets, redact_url_password,
-        sanitize_log_line, MAX_LOG_LINE_CHARS,
+        pnpm_command_args, pnpm_registry_command_args, progress_frames, redact_secrets,
+        redact_url_password, sanitize_log_line, MAX_LOG_LINE_CHARS,
     };
     use std::path::Path;
 
@@ -1935,9 +2007,44 @@ mod tests {
     #[test]
     fn limits_oversized_log_lines() {
         let line = "x".repeat(MAX_LOG_LINE_CHARS + 10);
-        let sanitized = sanitize_log_line(line);
+        let sanitized = sanitize_log_line(&line);
         assert!(sanitized.ends_with("... [line truncated]"));
         assert!(sanitized.len() > MAX_LOG_LINE_CHARS);
+    }
+
+    #[test]
+    fn strips_ansi_escapes_from_log_lines() {
+        assert_eq!(
+            sanitize_log_line("\u{1b}[34mℹ\u{1b}[39m tsdown v0.22.2 powered by \u{1b}[91mrolldown\u{1b}[39m"),
+            "ℹ tsdown v0.22.2 powered by rolldown"
+        );
+        assert_eq!(
+            sanitize_log_line("\u{1b}[32m> Moving conpty.dll...\u{1b}[0m"),
+            "> Moving conpty.dll..."
+        );
+        // OSC hyperlinks and two-character escapes are dropped as well.
+        assert_eq!(
+            sanitize_log_line("see \u{1b}]8;;https://example.com\u{7}example\u{1b}]8;;\u{7} now"),
+            "see example now"
+        );
+        assert_eq!(sanitize_log_line("plain\u{1b}7text"), "plaintext");
+    }
+
+    #[test]
+    fn splits_progress_frames_on_carriage_returns() {
+        let line = "Updating files:   9% (962/10319)\rUpdating files:  10% (1032/10319)\r";
+        assert_eq!(
+            progress_frames(line).collect::<Vec<_>>(),
+            vec![
+                "Updating files:   9% (962/10319)",
+                "Updating files:  10% (1032/10319)",
+            ]
+        );
+        assert_eq!(progress_frames("").count(), 0);
+        assert_eq!(
+            progress_frames("single frame").collect::<Vec<_>>(),
+            vec!["single frame"]
+        );
     }
 
     #[test]
