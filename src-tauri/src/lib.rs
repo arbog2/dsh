@@ -184,6 +184,13 @@ fn open_log_directory(app: AppHandle) -> Result<String, String> {
 }
 
 pub fn run() {
+    let context = tauri::generate_context!();
+    // Prune before `build`: Tauri creates the configured windows inside its own
+    // setup step, and once WebView2 has the profile open the cookie database is
+    // locked.
+    let pruned_cookie_files = webview_profile_dir(&context.config().identifier)
+        .map(|directory| prune_session_cookies(&directory))
+        .unwrap_or_default();
     let app = tauri::Builder::default()
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
             if let Some(window) = app.get_window("main") {
@@ -201,10 +208,20 @@ pub fn run() {
             open_log_directory,
             set_drawer_open
         ])
-        .setup(|app| {
+        .setup(move |app| {
             let handle = app.handle().clone();
             if let Err(error) = initialize_diagnostics(&handle) {
                 eprintln!("failed to initialize diagnostic logging: {error}");
+            }
+            if !pruned_cookie_files.is_empty() {
+                emit_log(
+                    &handle,
+                    "info",
+                    format!(
+                        "Cleared {} stored WebView2 session cookie file(s) before startup.",
+                        pruned_cookie_files.len()
+                    ),
+                );
             }
             emit_log(
                 &handle,
@@ -245,7 +262,7 @@ pub fn run() {
                 app.exit(0);
             }
         })
-        .build(tauri::generate_context!())
+        .build(context)
         .expect("failed to build DeepSeek Harness");
 
     app.run(|app_handle, event| {
@@ -1338,6 +1355,47 @@ fn remove_source_node_modules(directory: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// Directory holding the WebView2 profile (cookies, cache, local storage).
+fn webview_profile_dir(identifier: &str) -> Option<PathBuf> {
+    let local_app_data = std::env::var_os("LOCALAPPDATA")?;
+    Some(PathBuf::from(local_app_data).join(identifier).join("EBWebView"))
+}
+
+/// Drop the persisted session cookies before the WebView2 profile is opened.
+///
+/// Harness authenticates the browser session with an authority-scoped cookie
+/// (`dsh-auth-<hash of host and port>`), and the shell serves Harness on a fresh
+/// loopback port every launch. Cookies are scoped by host only, so each launch
+/// leaves another `dsh-auth-*` cookie behind and the browser then sends every
+/// one of them. Once the accumulated `Cookie` header passes the request-header
+/// limit, the plugin bundle request fails and the boot page stops at "Failed to
+/// load plugins".
+///
+/// The shell always re-authenticates through the token URL it prints, so the
+/// stored cookies carry nothing worth keeping. Removing them keeps the header
+/// small and the boot deterministic.
+///
+/// @param profile_dir - the WebView2 profile directory.
+/// @returns the paths that were removed, for diagnostic logging.
+fn prune_session_cookies(profile_dir: &Path) -> Vec<PathBuf> {
+    let mut removed = Vec::new();
+    for relative in [
+        "Default/Network/Cookies",
+        "Default/Network/Cookies-journal",
+        "Default/Cookies",
+        "Default/Cookies-journal",
+    ] {
+        let path = profile_dir.join(relative);
+        match fs::remove_file(&path) {
+            Ok(()) => removed.push(path),
+            // Absent on a first launch, and a lingering WebView2 process can
+            // hold the file; neither may block startup.
+            Err(_) => {}
+        }
+    }
+    removed
+}
+
 fn find_free_port() -> Result<u16, String> {
     let listener = std::net::TcpListener::bind("127.0.0.1:0")
         .map_err(|error| format!("failed to allocate a local port: {error}"))?;
@@ -1958,8 +2016,8 @@ fn strings<const N: usize>(values: [&str; N]) -> Vec<String> {
 mod tests {
     use super::{
         extract_authenticated_url, normalize_path_for_command, normalize_windows_path,
-        pnpm_command_args, pnpm_registry_command_args, progress_frames, redact_secrets,
-        redact_url_password, sanitize_log_line, MAX_LOG_LINE_CHARS,
+        pnpm_command_args, pnpm_registry_command_args, progress_frames, prune_session_cookies,
+        redact_secrets, redact_url_password, sanitize_log_line, MAX_LOG_LINE_CHARS,
     };
     use std::path::Path;
 
@@ -2045,6 +2103,28 @@ mod tests {
             progress_frames("single frame").collect::<Vec<_>>(),
             vec!["single frame"]
         );
+    }
+
+    #[test]
+    fn removes_persisted_session_cookie_files() {
+        let root = std::env::temp_dir().join(format!(
+            "dsh-cookie-prune-{}",
+            std::process::id()
+        ));
+        let network = root.join("Default").join("Network");
+        std::fs::create_dir_all(&network).expect("create fixture");
+        let cookies = network.join("Cookies");
+        let journal = network.join("Cookies-journal");
+        std::fs::write(&cookies, b"stale").expect("write fixture");
+        std::fs::write(&journal, b"stale").expect("write fixture");
+
+        let removed = prune_session_cookies(&root);
+
+        assert_eq!(removed.len(), 2);
+        assert!(!cookies.exists());
+        assert!(!journal.exists());
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
