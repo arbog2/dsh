@@ -58,22 +58,29 @@ node <runtime>\node_modules\@deepseek-ai\dsh\lib\bin.js web --port <port> --no-o
 
 ## 首次部署
 
-`runtime/harness-source.zip` 和 `runtime/harness-runtime.zip` 是只读资源。
+便携包不携带 Harness 源码或构建产物，只有 Node.js、pnpm、MinGit 和修复脚本。
 
-首次启动时：
+首次启动时（`ensure_installation`）：
 
-1. 解压到临时目录。
-2. 写入 `.deepseek-harness-ready` 标记。
-3. 将临时目录原子重命名为正式目录。
+1. 检查 `source`（`.git` + `package.json`）与 `runtime`（CLI 入口 + `package.json`）
+   是否都可用；可用则直接进入启动流程。
+2. 否则用内置 MinGit 克隆上游 `master`（`--depth 1 --single-branch`）。
+3. 依次执行 `pnpm install`、`pnpm run clean`、`pnpm run build`、`pnpm deploy`
+   到 `runtime-next`，再补跑 koffi / node-pty / spawn-helper 步骤。
+4. 将 `runtime-next` 原子换入 `runtime`，删除备份。
 
-如果部署中断，下次启动会删除未完成目录并重新解压。
+因此首次启动必须联网。构建期间的状态停留在 `initializing`，界面显示下载与构建
+进度；失败时不会写入任何半成品运行时。
 
 ## Harness 更新
 
-更新流程不会直接修改当前正在运行的 runtime。
+更新流程不会直接修改当前正在运行的 runtime，且会同时充当修复入口：源码目录缺失
+或损坏时会先重新克隆。
 
 1. 停止 Node.js 服务进程树。
-2. `git fetch origin master`。
+2. `git rev-parse HEAD` 读取本地提交，`git fetch origin master` 后读取 `FETCH_HEAD`；
+   两者相同则跳过后面的重建，直接把服务拉起来并报告“已是最新”（强制重建按钮跳过
+   这一步比较）。
 3. `git reset --hard FETCH_HEAD`。
 4. 清理未跟踪文件，但保留 `node_modules`。
 5. 安装 workspace 依赖。

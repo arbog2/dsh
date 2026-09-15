@@ -24,24 +24,46 @@ const environment = {
 
 runPnpm(["tauri", "build", "--no-bundle"], environment);
 
-const sources = [
-  join(releaseDir, "deepseek-harness.exe"),
-  join(releaseDir, "node.exe"),
-  join(releaseDir, "runtime"),
-  join(releaseDir, "tools"),
-];
-for (const source of sources) {
+// The bundle is assembled from the source tree rather than from whatever Tauri
+// left in the release directory. Tauri copies resources incrementally and never
+// prunes ones that were dropped from the configuration, so reading them back
+// would silently ship artifacts from earlier builds.
+const executables = [[join(releaseDir, "deepseek-harness.exe"), "DeepSeekHarness.exe"]];
+for (const [source] of executables) {
   if (!existsSync(source)) {
     throw new Error(`Release artifact is missing: ${source}`);
+  }
+}
+const resources = [
+  [join(root, "runtime", "node", "node.exe"), "node.exe", false],
+  [join(root, "runtime", "pnpm"), join("runtime", "pnpm"), true],
+  [join(root, "runtime", "git"), join("runtime", "git"), true],
+  [join(root, "scripts", "repair-runtime.mjs"), join("tools", "repair-runtime.mjs"), false],
+];
+for (const [source] of resources) {
+  if (!existsSync(source)) {
+    throw new Error(`Bundle resource is missing: ${source}`);
+  }
+}
+
+// The bundled seed archives are intentionally absent: the first run clones and
+// builds Harness from GitHub instead of unpacking a shipped baseline.
+for (const name of ["harness-source.zip", "harness-runtime.zip"]) {
+  if (existsSync(join(root, "runtime", name))) {
+    console.log(`Note: runtime/${name} exists locally but is not packaged.`);
   }
 }
 
 rmSync(stagingDir, { recursive: true, force: true });
 mkdirSync(stagingDir, { recursive: true });
-cpSync(sources[0], join(stagingDir, "DeepSeekHarness.exe"));
-cpSync(sources[1], join(stagingDir, "node.exe"));
-cpSync(sources[2], join(stagingDir, "runtime"), { recursive: true });
-cpSync(sources[3], join(stagingDir, "tools"), { recursive: true });
+for (const [source, destination] of executables) {
+  cpSync(source, join(stagingDir, destination));
+}
+for (const [source, destination, recursive] of resources) {
+  const target = join(stagingDir, destination);
+  mkdirSync(dirname(target), { recursive: true });
+  cpSync(source, target, { recursive });
+}
 
 rmSync(outputDir, { recursive: true, force: true });
 renameSync(stagingDir, outputDir);

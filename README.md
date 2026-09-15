@@ -25,25 +25,26 @@ DeepSeekHarness-portable-x64.zip
 
 - Windows 10 或 Windows 11，x64。
 - Microsoft Edge WebView2 Runtime。绝大多数现代 Windows 10/11 已预装。
-- 用户目录可写。
-- 初次启动建议预留至少 1 GB 可用空间。
-- Harness 更新功能需要可访问 GitHub；初始运行不需要网络。
+- 用户目录可写
+- **首次启动需要可访问 GitHub**：程序会从上游克隆并构建 Harness
+- 首次运行建议预留至少 3 GB 可用空间（源码、完整依赖树和 pnpm 存储）
 
 ## 首次启动
 
-首次启动时，程序会在用户可写目录中部署 Harness：
+便携包只包含运行所需的工具，不附带 Harness 源码或构建产物。首次启动时，程序会在
+用户可写目录中部署 Harness：
 
 ```text
 %APPDATA%\com.deepseek.harness.desktop\harness\
-├── source\       # Harness Git 源码工作目录
-└── runtime\      # 当前生产依赖和 Web 构建产物
+├── source\       # 从 GitHub 克隆的 Harness Git 工作目录
+└── runtime\      # 本地构建出的生产依赖和 Web 构建产物
 ```
 
-同时会解压便携包中的 `runtime/harness-source.zip` 和
-`runtime/harness-runtime.zip`。因此首次启动需要等待一段时间，具体取决于磁盘
-性能和杀毒软件扫描速度。
+首次启动会依次执行：`git clone` 上游 `master`、`pnpm install`、
+`pnpm run clean`、`pnpm run build`、`pnpm deploy`，然后启动服务。整个过程通常需要
+5–15 分钟，具体取决于网络、磁盘和杀毒软件。**这一步必须联网。**
 
-后续启动会复用已部署的 `source` 和 `runtime`，速度会明显加快。
+后续启动会复用已部署的 `source` 和 `runtime`，只需几秒。
 
 ## 界面
 
@@ -59,9 +60,10 @@ DeepSeekHarness-portable-x64.zip
 
 顶部控制栏提供：
 
-- 当前 Harness 状态。
+- 当前 Harness 状态与本地 Harness 版本号。
 - 重启 Harness。
-- 更新 Harness。
+- 更新 Harness（已是最新版本时直接返回，不重新构建）。
+- 强制重新构建（即使本地提交与上游一致也完整重建，用于修复损坏的运行时）。
 - 中英文切换。
 - 展开或收起状态与日志抽屉。
 
@@ -70,18 +72,21 @@ DeepSeekHarness-portable-x64.zip
 点击更新按钮后，程序会依次执行：
 
 1. 停止当前 Harness 服务。
-2. 获取上游 `master` 最新提交。
-3. 重置可写源码目录。
-4. 执行 `pnpm install --frozen-lockfile`。
-5. 执行 `pnpm run clean`。
-6. 执行 `pnpm run build`。
-7. 生成新的生产运行时目录。
-8. 修复生产树中可能缺失的 workspace peer 依赖。
-9. 运行 node-pty、koffi 等必要的安装步骤。
-10. 切换到新运行时并重新启动 Harness。
+2. 读取本地提交，获取上游 `master` 最新提交。
+3. **若两者一致则直接重启服务并提示“已是最新”，不做任何重建。**
+4. 重置可写源码目录并清理未跟踪文件。
+5. 执行 `pnpm install --frozen-lockfile`。
+6. 执行 `pnpm run clean`。
+7. 执行 `pnpm run build`。
+8. 生成新的生产运行时目录（`runtime-next`）。
+9. 修复生产树中可能缺失的 workspace peer 依赖。
+10. 运行 node-pty、koffi 等必要的安装步骤。
+11. 切换到新运行时并重新启动 Harness。
+
+如果源码目录缺失或损坏，更新会先重新克隆，因此更新同时充当修复入口。
 
 更新期间会保留旧运行时。如果新版本构建失败或启动失败，应用会恢复旧运行时并
-继续提供服务。
+继续提供服务。强制重新构建按钮走同一流程，但跳过第 3 步的比较。
 
 ## 便携包结构
 
@@ -90,17 +95,16 @@ DeepSeekHarness\
 ├── DeepSeekHarness.exe
 ├── node.exe
 ├── runtime\
-│   ├── node\
 │   ├── pnpm\
-│   ├── git\
-│   ├── harness-source.zip
-│   └── harness-runtime.zip
+│   └── git\
 └── tools\
     └── repair-runtime.mjs
 ```
 
-`node.exe` 是 Tauri sidecar。`runtime` 和 `tools` 通过相对路径定位，因此整个
-`DeepSeekHarness` 目录可以移动到其他位置或其他 Windows x64 电脑。
+便携包不包含 Harness 源码或构建产物，压缩包约 79 MiB、解压后约 201 MiB。
+`node.exe` 同时用作 Tauri sidecar 和所有构建命令的解释器。`runtime` 和 `tools`
+通过相对路径定位，因此整个 `DeepSeekHarness` 目录可以移动到其他位置或其他
+Windows x64 电脑。
 
 ## 数据与重置
 
@@ -114,7 +118,9 @@ DeepSeekHarness\
 
 1. 关闭 DSH Desktop。
 2. 删除 `%APPDATA%\com.deepseek.harness.desktop\harness`。
-3. 重新启动 `DeepSeekHarness.exe`。
+3. 重新启动 `DeepSeekHarness.exe`，程序会重新克隆并构建。
+
+如果运行环境被破坏但源码目录完好，也可以直接用顶部控制栏的“强制重新构建”。
 
 DSH 的会话、凭据和工作区设置由 Harness 自身管理，删除 Harness 工作副本不一定
 会删除这些用户数据。

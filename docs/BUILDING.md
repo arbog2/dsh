@@ -40,8 +40,11 @@ pnpm prepare:runtime
 - 生成生产部署。
 - 修复 workspace peer 依赖。
 - 执行 node-pty、koffi 和 subprocess helper 安装步骤。
-- 生成 `harness-source.zip` 和 `harness-runtime.zip`。
-- 生成 Tauri sidecar。
+
+这些目录（`runtime\node`、`runtime\pnpm`、`runtime\git`、`runtime\harness-source`、
+`runtime\harness-runtime`）留在磁盘上供本地开发与排查使用，但**不再打包进便携版**：
+桌面程序首次启动时自行克隆并构建 Harness。因此发布包只包含 Node.js、pnpm、
+MinGit 和修复脚本。
 
 如果下载源不可访问，脚本会尝试备用镜像。
 
@@ -84,12 +87,16 @@ pnpm package:portable
 1. `pnpm tauri build --no-bundle`
 2. 创建 `DeepSeekHarness` 目录。
 3. 复制 `DeepSeekHarness.exe`。
-4. 复制 `node.exe`。
-5. 复制 `runtime`。
-6. 复制 `tools`。
+4. 从 `runtime\node\node.exe` 复制 `node.exe`。
+5. 从 `runtime` 复制 `pnpm` 和 `git`。
+6. 从 `scripts` 复制 `repair-runtime.mjs` 到 `tools`。
 7. 生成 `DeepSeekHarness-portable-x64.zip`。
 
-发布时应上传 ZIP，不需要上传解压后的目录。
+便携包直接从源码树组装，不读取 `src-tauri\target\release` 下 Tauri 的增量资源
+目录——那里的历史资源不会被自动清理。`runtime\harness-source.zip` 和
+`runtime\harness-runtime.zip` 即使本地存在也不会被打包。
+
+发布时应上传 ZIP，不需要上传解压后的目录。当前产物约 79 MiB（解压后约 201 MiB）。
 
 ## 构建安装包
 
@@ -100,8 +107,8 @@ pnpm tauri build
 会生成：
 
 ```text
-src-tauri\target\release\bundle\nsis\DeepSeek Harness_0.1.6_x64-setup.exe
-src-tauri\target\release\bundle\msi\DeepSeek Harness_0.1.6_x64_en-US.msi
+src-tauri\target\release\bundle\nsis\DeepSeek Harness_0.1.7_x64-setup.exe
+src-tauri\target\release\bundle\msi\DeepSeek Harness_0.1.7_x64_en-US.msi
 ```
 
 当前主要发布目标是免安装便携包。
@@ -111,8 +118,12 @@ src-tauri\target\release\bundle\msi\DeepSeek Harness_0.1.6_x64_en-US.msi
 - `pnpm build:web` 通过。
 - `cargo check` 通过。
 - `cargo test --lib` 通过。
-- 从空 `%APPDATA%` 启动便携版成功。
-- 状态从“正在准备本地运行环境”切换到“Harness 已就绪”。
+- 从空 `%APPDATA%` 联网启动便携版成功（首次运行克隆并构建 Harness）。
+- 首次运行期间显示“正在准备首次运行环境”与构建进度，构建完成后切换到
+  “Harness 已就绪”。
+- 第二次启动复用已有安装，日志出现 `Harness is already installed`。
+- 版本相同的情况下点击更新返回“已是最新”，不触发重建。
+- 强制重新构建按钮可以完整重建并恢复服务。
 - 中英文切换正常。
 - 状态与日志抽屉可以展开和收起。
 - 更新成功后 Harness 能重新启动。

@@ -12,7 +12,7 @@ import {
   rmSync,
   writeFileSync,
 } from "node:fs";
-import { basename, dirname, join, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
@@ -36,9 +36,10 @@ await preparePnpm();
 await prepareGit();
 await prepareHarnessSource();
 await buildHarnessRuntime();
-archiveDirectory(join(runtime, "harness-source"), join(runtime, "harness-source.zip"));
-archiveDirectory(join(runtime, "harness-runtime"), join(runtime, "harness-runtime.zip"));
-copyNodeSidecar();
+// The desktop shell no longer ships seed archives: the first run clones and
+// builds Harness from GitHub, so only Node.js, pnpm, MinGit, and the sidecar
+// travel inside the bundle. The prepared directories above stay on disk for
+// local development and manual inspection.
 writeFileSync(join(runtime, ".prepared"), `${new Date().toISOString()}\n`);
 
 console.log("Runtime preparation complete.");
@@ -362,19 +363,7 @@ function findSymlink(directory) {
   return undefined;
 }
 
-function copyNodeSidecar() {
-  const binaries = join(root, "src-tauri", "binaries");
-  mkdirSync(binaries, { recursive: true });
-  const destination = join(binaries, "node-x86_64-pc-windows-msvc.exe");
-  copyFileSync(join(runtime, "node", "node.exe"), destination);
-  console.log(`Prepared Tauri sidecar ${basename(destination)}.`);
-}
 
-function archiveDirectory(source, destination) {
-  rmSync(destination, { force: true });
-  run("tar.exe", ["-a", "-c", "-f", destination, "-C", source, "."], root);
-  console.log(`Prepared archive ${basename(destination)}.`);
-}
 
 async function download(urls, filename) {
   const destination = join(downloads, filename);

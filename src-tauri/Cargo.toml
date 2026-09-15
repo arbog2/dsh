@@ -1,6 +1,6 @@
 [package]
 name = "deepseek-harness"
-version = "0.1.6"
+version = "0.1.7"
 description = "Self-contained DeepSeek Harness desktop shell"
 authors = ["DeepSeek Harness Contributors"]
 license = "MIT"
@@ -25,8 +25,6 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tauri = { version = "2", features = ["unstable"] }
-tauri-plugin-shell = "2"
 tauri-plugin-single-instance = "2.4.4"
 tokio = { version = "1", features = ["io-util", "macros", "process", "rt-multi-thread", "time"] }
 url = "2"
-zip = { version = "2", default-features = false, features = ["deflate"] }

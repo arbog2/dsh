@@ -17,10 +17,6 @@ use tauri::{
     AppHandle, Emitter, Manager, PhysicalPosition, PhysicalSize, RunEvent, State, WebviewBuilder,
     WebviewUrl, WindowEvent,
 };
-use tauri_plugin_shell::{
-    process::{CommandChild, CommandEvent},
-    ShellExt,
-};
 use tokio::{
     io::{AsyncBufReadExt, BufReader as TokioBufReader},
     process::Command as AsyncCommand,
@@ -55,8 +51,8 @@ impl Default for HarnessStatus {
         Self {
             revision: 0,
             state: "initializing".into(),
-            message: "Preparing the local runtime".into(),
-            detail: "The first launch can take a moment while files are prepared.".into(),
+            message: "Checking the local runtime".into(),
+            detail: "Verifying the bundled Harness files.".into(),
             port: None,
             url: None,
             progress: 0,
@@ -69,7 +65,7 @@ impl Default for HarnessStatus {
 #[derive(Default)]
 struct AppState {
     status: Mutex<HarnessStatus>,
-    child: Mutex<Option<CommandChild>>,
+    child: Mutex<Option<tokio::process::Child>>,
     authenticated_url: Mutex<Option<String>>,
     diagnostics: Mutex<Option<DiagnosticLogState>>,
     generation: AtomicU64,
@@ -133,6 +129,7 @@ async fn restart_harness(app: AppHandle) -> Result<HarnessStatus, String> {
 async fn update_harness(
     app: AppHandle,
     state: State<'_, AppState>,
+    force: Option<bool>,
 ) -> Result<HarnessStatus, String> {
     if state.update_in_progress.swap(true, Ordering::SeqCst) {
         return Err("An update is already in progress.".into());
@@ -145,12 +142,24 @@ async fn update_harness(
             format!("Could not create the update diagnostic log: {error}"),
         );
     }
-    let result = perform_update(app.clone()).await;
+    let force = force.unwrap_or(false);
+    if force {
+        emit_log(
+            &app,
+            "info",
+            "Forcing a full rebuild even if the checkout already matches origin/master.",
+        );
+    }
+    let result = perform_update(app.clone(), force).await;
     finish_update_log(&app, result.as_ref());
     state.update_in_progress.store(false, Ordering::SeqCst);
 
     match result {
-        Ok(status) => {
+        Ok(mut status) => {
+            // `perform_update` stops and restarts the service, and the status it
+            // captured still carries the in-progress flag. Publishing that as-is
+            // would leave every update control disabled until the next launch.
+            status.update_in_progress = false;
             publish_status(&app, status.clone());
             Ok(status)
         }
@@ -159,6 +168,38 @@ async fn update_harness(
             Err(error)
         }
     }
+}
+
+/// Reads the Harness version from the runtime that is actually installed. The
+/// packaged shell version is unrelated to the Harness release, so this has to be
+/// resolved at runtime instead of being baked into the build.
+fn harness_version(app: &AppHandle) -> Option<String> {
+    let runtime_package = writable_runtime_dir(app)
+        .ok()?
+        .join("node_modules")
+        .join("@deepseek-ai")
+        .join("dsh")
+        .join("package.json");
+    read_package_version(&runtime_package).or_else(|| {
+        let source_package = writable_source_dir(app).ok()?.join("package.json");
+        read_package_version(&source_package)
+    })
+}
+
+fn read_package_version(path: &Path) -> Option<String> {
+    let text = fs::read_to_string(path).ok()?;
+    let manifest: serde_json::Value = serde_json::from_str(&text).ok()?;
+    let version = manifest.get("version")?.as_str()?.trim();
+    if version.is_empty() {
+        None
+    } else {
+        Some(version.to_string())
+    }
+}
+
+#[tauri::command]
+fn get_harness_version(app: AppHandle) -> Result<String, String> {
+    harness_version(&app).ok_or_else(|| "Harness runtime is not installed yet.".to_string())
 }
 
 #[tauri::command]
@@ -198,13 +239,13 @@ pub fn run() {
                 let _ = window.set_focus();
             }
         }))
-        .plugin(tauri_plugin_shell::init())
         .manage(AppState::default())
         .invoke_handler(tauri::generate_handler![
             get_status,
             open_harness,
             restart_harness,
             update_harness,
+            get_harness_version,
             open_log_directory,
             set_drawer_open
         ])
@@ -234,23 +275,15 @@ pub fn run() {
                 ),
             );
             tauri::async_runtime::spawn(async move {
-                let init_handle = handle.clone();
-                let init_result =
-                    tauri::async_runtime::spawn_blocking(move || init_harness_dirs(&init_handle))
-                        .await;
-
-                match init_result {
-                    Ok(Ok(())) => {
-                        if let Err(error) = start_service(handle.clone()).await {
-                            set_error(&handle, &error, "Startup failed");
-                        }
-                    }
-                    Ok(Err(error)) => set_error(&handle, &error, "Initialization failed"),
-                    Err(error) => set_error(
-                        &handle,
-                        &format!("Initialization task failed: {error}"),
-                        "Initialization failed",
-                    ),
+                // The first launch clones and builds Harness from GitHub; every
+                // later launch finds the installation in place and only has to
+                // start the service.
+                if let Err(error) = ensure_installation(&handle).await {
+                    set_error(&handle, &error, "Initialization failed");
+                    return;
+                }
+                if let Err(error) = start_service(handle.clone()).await {
+                    set_error(&handle, &error, "Startup failed");
                 }
             });
             Ok(())
@@ -287,19 +320,14 @@ async fn start_service(app: AppHandle) -> Result<HarnessStatus, String> {
         10,
     );
 
+    // The installation is guaranteed to be complete before the service starts,
+    // so a damaged checkout is repaired by an update rather than here.
     let source_dir = writable_source_dir(&app)?;
-    if !source_dir.join(".git").exists() {
-        repair_source_checkout(&app)?;
-    }
+    let node = bundled_node_path()?;
 
     let port = find_free_port()?;
     let url = format!("http://127.0.0.1:{port}");
-    let runtime_entry = writable_runtime_dir(&app)?
-        .join("node_modules")
-        .join("@deepseek-ai")
-        .join("dsh")
-        .join("lib")
-        .join("bin.js");
+    let runtime_entry = runtime_entry_path(&writable_runtime_dir(&app)?);
     if !runtime_entry.exists() {
         return Err(format!(
             "Harness runtime entry is missing at {}",
@@ -311,10 +339,8 @@ async fn start_service(app: AppHandle) -> Result<HarnessStatus, String> {
     let runtime_entry_arg = normalize_path_for_command(&runtime_entry);
     let source_dir_arg = normalize_path_for_command(&source_dir);
     let pnpm_home_arg = normalize_path_for_command(&pnpm_home);
-    let sidecar = app
-        .shell()
-        .sidecar("node")
-        .map_err(|error| format!("failed to resolve bundled Node.js: {error}"))?
+    let mut command = AsyncCommand::new(&node);
+    command
         .args([
             runtime_entry_arg,
             "web".into(),
@@ -323,12 +349,32 @@ async fn start_service(app: AppHandle) -> Result<HarnessStatus, String> {
             "--no-open".into(),
         ])
         .current_dir(Path::new(&source_dir_arg))
-        .env("PNPM_HOME", pnpm_home_arg);
+        .env("PNPM_HOME", pnpm_home_arg)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    #[cfg(windows)]
+    {
+        // tokio's Command exposes the Windows creation flags directly, so no
+        // `std::os::windows::process::CommandExt` import is needed here.
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
 
-    let (mut receiver, child) = sidecar
+    let mut child = command
         .spawn()
         .map_err(|error| format!("failed to start Harness: {error}"))?;
-    let pid = child.pid();
+    let pid = child
+        .id()
+        .ok_or_else(|| "the Harness process exited before it could be tracked".to_string())?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| "failed to capture the Harness stdout stream".to_string())?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| "failed to capture the Harness stderr stream".to_string())?;
     let generation = app.state::<AppState>().generation.fetch_add(1, Ordering::SeqCst) + 1;
     *app.state::<AppState>()
         .child
@@ -340,50 +386,45 @@ async fn start_service(app: AppHandle) -> Result<HarnessStatus, String> {
         "info",
         format!("Started Harness process {pid} on port {port}"),
     );
-    let log_handle = app.clone();
+    // The stdout stream reaching EOF means the service is gone. That single
+    // signal drives both the log and the unexpected-exit report, so no separate
+    // process watcher is needed.
+    let stdout_handle = app.clone();
     tauri::async_runtime::spawn(async move {
-        while let Some(event) = receiver.recv().await {
-            match event {
-                CommandEvent::Stdout(line) => {
-                    let line = sanitize_log_line(String::from_utf8_lossy(&line).trim_end());
-                    if let Some(authenticated_url) = extract_authenticated_url(&line, port) {
-                        *log_handle
-                            .state::<AppState>()
-                            .authenticated_url
-                            .lock()
-                            .expect("authenticated URL lock poisoned") =
-                            Some(authenticated_url);
-                    }
-                    emit_log(
-                        &log_handle,
-                        "info",
-                        line,
-                    );
-                }
-                CommandEvent::Stderr(line) => {
-                    emit_log(
-                        &log_handle,
-                        "warn",
-                        sanitize_log_line(String::from_utf8_lossy(&line).trim_end()),
-                    );
-                }
-                CommandEvent::Error(error) => {
-                    emit_log(&log_handle, "error", error);
-                }
-                CommandEvent::Terminated(payload) => {
-                    let state = log_handle.state::<AppState>();
-                    if state.generation.load(Ordering::SeqCst) == generation {
-                        state.child.lock().expect("child lock poisoned").take();
-                        let message = match payload.code {
-                            Some(code) => format!("Harness stopped unexpectedly (exit code {code})."),
-                            None => "Harness stopped unexpectedly.".to_string(),
-                        };
-                        set_error(&log_handle, &message, "Harness stopped");
-                    }
-                    break;
-                }
-                _ => {}
+        let mut lines = TokioBufReader::new(stdout).lines();
+        while let Ok(Some(line)) = lines.next_line().await {
+            let line = sanitize_log_line(line.trim_end());
+            if let Some(authenticated_url) = extract_authenticated_url(&line, port) {
+                *stdout_handle
+                    .state::<AppState>()
+                    .authenticated_url
+                    .lock()
+                    .expect("authenticated URL lock poisoned") =
+                    Some(authenticated_url);
             }
+            emit_log(&stdout_handle, "info", line);
+        }
+        let state = stdout_handle.state::<AppState>();
+        if state.generation.load(Ordering::SeqCst) != generation {
+            // A restart or update stopped this process on purpose.
+            return;
+        }
+        state.child.lock().expect("child lock poisoned").take();
+        set_error(
+            &stdout_handle,
+            "Harness stopped unexpectedly.",
+            "Harness stopped",
+        );
+    });
+    let stderr_handle = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let mut lines = TokioBufReader::new(stderr).lines();
+        while let Ok(Some(line)) = lines.next_line().await {
+            emit_log(
+                &stderr_handle,
+                "warn",
+                sanitize_log_line(line.trim_end()),
+            );
         }
     });
 
@@ -418,7 +459,291 @@ async fn start_service(app: AppHandle) -> Result<HarnessStatus, String> {
     Ok(status)
 }
 
-async fn perform_update(app: AppHandle) -> Result<HarnessStatus, String> {
+/// Where the writable checkout is cloned from on first launch and on repair.
+const HARNESS_CLONE_URL: &str = "https://github.com/deepseek-ai/deepseek-harness.git";
+/// The branch the desktop shell tracks. Updates fetch this ref directly.
+const HARNESS_BRANCH: &str = "master";
+
+/// Result of the checkout comparison that opens an update.
+enum UpdateOutcome {
+    /// The writable checkout already points at the fetched revision.
+    UpToDate { revision: String },
+    /// A fresh runtime was built and activated.
+    Rebuilt,
+}
+
+/// Git prints full 40 character object names; the UI only needs enough to tell
+/// two revisions apart.
+fn short_revision(revision: &str) -> String {
+    revision.chars().take(7).collect()
+}
+
+/// A rebuild is only skipped when the fetched revision is known to match the
+/// checkout. An unreadable local revision (`""`) is treated as unknown and
+/// falls through to a full rebuild, which is the safe direction.
+fn update_needs_rebuild(local_revision: &str, remote_revision: &str, force: bool) -> bool {
+    if force {
+        return true;
+    }
+    local_revision.is_empty() || remote_revision.is_empty() || local_revision != remote_revision
+}
+
+/// A source checkout is usable when it is a Git work tree with a manifest. The
+/// desktop shell rebuilds from it, so `.git` is as important as the sources.
+fn source_is_installed(directory: &Path) -> bool {
+    directory.join(".git").is_dir() && directory.join("package.json").is_file()
+}
+
+/// A runtime is usable when the deployed dependency tree exposes the CLI entry
+/// point. The package manifest is checked too because the deploy step rewrites
+/// it and a half-written tree must not be mistaken for a working one.
+fn runtime_is_installed(directory: &Path) -> bool {
+    runtime_entry_path(directory).is_file() && directory.join("package.json").is_file()
+}
+
+/// True when both halves of the installation are present.
+fn installation_is_complete(app: &AppHandle) -> Result<bool, String> {
+    Ok(source_is_installed(&writable_source_dir(app)?)
+        && runtime_is_installed(&writable_runtime_dir(app)?))
+}
+
+/// Clones the tracked branch when the writable checkout is missing or damaged.
+///
+/// The packaged application deliberately does not ship a source archive: the
+/// download is a few dozen megabytes and guarantees the first run starts from
+/// the newest revision instead of whatever was current when the executable was
+/// built.
+async fn ensure_source_checkout(app: &AppHandle, source_dir: &Path) -> Result<(), String> {
+    if source_is_installed(source_dir) {
+        return Ok(());
+    }
+    let git = resource_path(app, "runtime/git/cmd/git.exe")?;
+    remove_directory_if_exists(source_dir)?;
+    if let Some(parent) = source_dir.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|error| format!("failed to create {}: {error}", parent.display()))?;
+    }
+    set_install_progress(
+        app,
+        15,
+        "Cloning the Harness source repository",
+        "Fetching the tracked branch from GitHub.",
+    );
+    let target = normalize_path_for_command(source_dir);
+    run_command(
+        app,
+        &git,
+        vec![
+            "clone".into(),
+            "--depth".into(),
+            "1".into(),
+            "--branch".into(),
+            HARNESS_BRANCH.into(),
+            "--single-branch".into(),
+            HARNESS_CLONE_URL.into(),
+            target,
+        ],
+        source_dir
+            .parent()
+            .ok_or_else(|| format!("invalid source path {}", source_dir.display()))?,
+        Vec::new(),
+        "git clone",
+    )
+    .await?;
+    if !source_is_installed(source_dir) {
+        return Err(format!(
+            "the cloned checkout is missing its Git metadata at {}",
+            source_dir.display()
+        ));
+    }
+    Ok(())
+}
+
+/// Installs dependencies, builds the workspace, and deploys a production-only
+/// dependency tree into `next_runtime`.
+///
+/// This is the whole build half of a first run and of an update. It never
+/// touches the active runtime, so a failure leaves the previous installation
+/// exactly as it was.
+async fn build_runtime_into(
+    app: &AppHandle,
+    source_dir: &Path,
+    next_runtime: &Path,
+    installing: bool,
+) -> Result<(), String> {
+    let node = bundled_node_path()?;
+    let pnpm = resource_path(app, "runtime/pnpm/pnpm.cjs")?;
+    let pnpm_home = resource_path(app, "runtime/pnpm")?;
+
+    report_build_progress(
+        app,
+        installing,
+        24,
+        "Installing dependencies",
+        "Resolving the locked Harness workspace.",
+    );
+    run_pnpm_with_registry_fallback(
+        app,
+        &node,
+        &pnpm,
+        source_dir,
+        &pnpm_home,
+        strings(["install", "--frozen-lockfile"]),
+        "pnpm install",
+    )
+    .await?;
+
+    report_build_progress(
+        app,
+        installing,
+        52,
+        "Cleaning build state",
+        "Removing stale incremental build artifacts.",
+    );
+    run_pnpm(
+        app,
+        &node,
+        &pnpm,
+        source_dir,
+        &pnpm_home,
+        strings(["run", "clean"]),
+        "pnpm run clean",
+    )
+    .await?;
+
+    report_build_progress(
+        app,
+        installing,
+        61,
+        "Building Harness",
+        "Compiling the host, client, and Web application.",
+    );
+    run_pnpm(
+        app,
+        &node,
+        &pnpm,
+        source_dir,
+        &pnpm_home,
+        strings(["run", "build"]),
+        "pnpm run build",
+    )
+    .await?;
+
+    report_build_progress(
+        app,
+        installing,
+        88,
+        "Packaging runtime",
+        "Creating a production-only dependency tree.",
+    );
+    remove_directory_if_exists(next_runtime)?;
+    run_pnpm_with_registry_fallback(
+        app,
+        &node,
+        &pnpm,
+        source_dir,
+        &pnpm_home,
+        vec![
+            "--filter".into(),
+            "dsh-python-runtime-closure".into(),
+            "deploy".into(),
+            "--legacy".into(),
+            "--prod".into(),
+            "--config.allow-unused-patches=true".into(),
+            "--config.node-linker=hoisted".into(),
+            "--config.auto-install-peers=true".into(),
+            "--config.link-workspace-packages=true".into(),
+            "--config.ignore-scripts=true".into(),
+            normalize_path_for_command(next_runtime),
+        ],
+        "pnpm deploy",
+    )
+    .await?;
+
+    let repair_script = resource_path(app, "tools/repair-runtime.mjs")?;
+    run_command(
+        app,
+        &node,
+        vec![
+            normalize_path_for_command(&repair_script),
+            normalize_path_for_command(source_dir),
+            normalize_path_for_command(next_runtime),
+        ],
+        source_dir,
+        Vec::new(),
+        "runtime dependency repair",
+    )
+    .await?;
+    prepare_deployed_runtime(app, &node, next_runtime).await?;
+    remove_source_node_modules(source_dir)?;
+
+    if !runtime_is_installed(next_runtime) {
+        return Err(format!(
+            "New runtime entry is missing at {}",
+            runtime_entry_path(next_runtime).display()
+        ));
+    }
+    Ok(())
+}
+
+/// Builds the very first installation. Runs once per machine: every later
+/// launch finds both directories in place and only has to start the service.
+async fn ensure_installation(app: &AppHandle) -> Result<(), String> {
+    if installation_is_complete(app)? {
+        emit_log(
+            app,
+            "info",
+            "Harness is already installed; skipping the first-run download.",
+        );
+        return Ok(());
+    }
+
+    set_phase(
+        app,
+        "initializing",
+        "Preparing the first-run environment",
+        "Downloading the latest Harness source from GitHub. This only happens once.",
+        "Initialization",
+        5,
+    );
+
+    let source_dir = writable_source_dir(app)?;
+    let active_runtime = writable_runtime_dir(app)?;
+    let next_runtime = active_runtime.with_file_name("runtime-next");
+    let backup_runtime = active_runtime.with_file_name("runtime-backup");
+
+    // A half-finished earlier attempt must not be mistaken for a usable
+    // installation, and a damaged checkout is simply replaced by a fresh clone.
+    ensure_source_checkout(app, &source_dir).await?;
+    let build_result = build_runtime_into(app, &source_dir, &next_runtime, true).await;
+    if let Err(error) = build_result {
+        let _ = remove_directory_if_exists(&next_runtime);
+        let _ = remove_directory_if_exists(&backup_runtime);
+        return Err(format!(
+            "The first-run build failed: {error}. Check the network connection and press Update to try again."
+        ));
+    }
+
+    set_install_progress(
+        app,
+        96,
+        "Activating runtime",
+        "Switching to the newly built Harness release.",
+    );
+    if let Err(error) = activate_runtime(&active_runtime, &next_runtime, &backup_runtime) {
+        let _ = remove_directory_if_exists(&next_runtime);
+        return Err(format!("Failed to activate the first-run runtime: {error}"));
+    }
+    let _ = remove_directory_if_exists(&backup_runtime);
+    emit_log(
+        app,
+        "info",
+        "First-run installation completed; starting the Harness service.",
+    );
+    Ok(())
+}
+
+async fn perform_update(app: AppHandle, force: bool) -> Result<HarnessStatus, String> {
     let source_dir = writable_source_dir(&app)?;
     let active_runtime = writable_runtime_dir(&app)?;
     let next_runtime = active_runtime.with_file_name("runtime-next");
@@ -434,22 +759,51 @@ async fn perform_update(app: AppHandle) -> Result<HarnessStatus, String> {
         5,
     );
 
-    let build_result = async {
-        ensure_update_checkout(&app, &source_dir)?;
-        let git = resource_path(&app, "runtime/git/cmd/git.exe")?;
-        let node = resource_path(&app, "runtime/node/node.exe")?;
-        let pnpm = resource_path(&app, "runtime/pnpm/pnpm.cjs")?;
-        let pnpm_home = resource_path(&app, "runtime/pnpm")?;
+    let git = resource_path(&app, "runtime/git/cmd/git.exe")?;
+    // An update is also the repair path: a missing or damaged checkout is
+    // cloned again instead of failing.
+    if let Err(error) = ensure_source_checkout(&app, &source_dir).await {
+        return recover_after_update_failure(app, error).await;
+    }
 
+    let build_result = async {
+        let local_revision = run_command(
+            &app,
+            &git,
+            strings(["rev-parse", "HEAD"]),
+            &source_dir,
+            Vec::new(),
+            "git rev-parse HEAD",
+        )
+        .await?;
         run_command(
             &app,
             &git,
-            strings(["fetch", "--prune", "--depth", "1", "origin", "master"]),
+            strings(["fetch", "--prune", "--depth", "1", "origin", HARNESS_BRANCH]),
             &source_dir,
             Vec::new(),
             "git fetch",
         )
         .await?;
+        let remote_revision = run_command(
+            &app,
+            &git,
+            strings(["rev-parse", "FETCH_HEAD"]),
+            &source_dir,
+            Vec::new(),
+            "git rev-parse FETCH_HEAD",
+        )
+        .await?;
+
+        if !update_needs_rebuild(&local_revision, &remote_revision, force) {
+            // Rebuilding an identical revision costs minutes and produces the
+            // same runtime, so the update stops here. `force` is the escape
+            // hatch for a runtime that was damaged locally.
+            return Ok(UpdateOutcome::UpToDate {
+                revision: short_revision(&remote_revision),
+            });
+        }
+
         set_update_progress(&app, 14, "Applying source", "Updating the writable checkout.");
         run_command(
             &app,
@@ -470,122 +824,41 @@ async fn perform_update(app: AppHandle) -> Result<HarnessStatus, String> {
         )
         .await?;
 
-        set_update_progress(
-            &app,
-            24,
-            "Installing dependencies",
-            "Resolving the locked Harness workspace.",
-        );
-        run_pnpm_with_registry_fallback(
-            &app,
-            &node,
-            &pnpm,
-            &source_dir,
-            &pnpm_home,
-            strings(["install", "--frozen-lockfile"]),
-            "pnpm install",
-        )
-        .await?;
-
-        set_update_progress(
-            &app,
-            52,
-            "Cleaning build state",
-            "Removing stale incremental build artifacts.",
-        );
-        run_pnpm(
-            &app,
-            &node,
-            &pnpm,
-            &source_dir,
-            &pnpm_home,
-            strings(["run", "clean"]),
-            "pnpm run clean",
-        )
-        .await?;
-
-        set_update_progress(
-            &app,
-            61,
-            "Building Harness",
-            "Compiling the host, client, and Web application.",
-        );
-        run_pnpm(
-            &app,
-            &node,
-            &pnpm,
-            &source_dir,
-            &pnpm_home,
-            strings(["run", "build"]),
-            "pnpm run build",
-        )
-        .await?;
-
-        set_update_progress(
-            &app,
-            88,
-            "Packaging runtime",
-            "Creating a production-only dependency tree.",
-        );
-        remove_directory_if_exists(&next_runtime)?;
-        run_pnpm_with_registry_fallback(
-            &app,
-            &node,
-            &pnpm,
-            &source_dir,
-            &pnpm_home,
-            vec![
-                "--filter".into(),
-                "dsh-python-runtime-closure".into(),
-                "deploy".into(),
-                "--legacy".into(),
-                "--prod".into(),
-                "--config.allow-unused-patches=true".into(),
-                "--config.node-linker=hoisted".into(),
-                "--config.auto-install-peers=true".into(),
-                "--config.link-workspace-packages=true".into(),
-                "--config.ignore-scripts=true".into(),
-                normalize_path_for_command(&next_runtime),
-            ],
-            "pnpm deploy",
-        )
-        .await?;
-        let repair_script = resource_path(&app, "tools/repair-runtime.mjs")?;
-        run_command(
-            &app,
-            &node,
-            vec![
-                normalize_path_for_command(&repair_script),
-                normalize_path_for_command(&source_dir),
-                normalize_path_for_command(&next_runtime),
-            ],
-            &source_dir,
-            Vec::new(),
-            "runtime dependency repair",
-        )
-        .await?;
-        prepare_deployed_runtime(&app, &node, &next_runtime).await?;
-        remove_source_node_modules(&source_dir)?;
-
-        let entry = next_runtime
-            .join("node_modules")
-            .join("@deepseek-ai")
-            .join("dsh")
-            .join("lib")
-            .join("bin.js");
-        if !entry.exists() {
-            return Err(format!(
-                "New runtime entry is missing at {}",
-                entry.display()
-            ));
-        }
-        Ok::<(), String>(())
+        build_runtime_into(&app, &source_dir, &next_runtime, false).await?;
+        Ok(UpdateOutcome::Rebuilt)
     }
     .await;
 
-    if let Err(error) = build_result {
-        let _ = remove_directory_if_exists(&next_runtime);
-        return recover_after_update_failure(app, error).await;
+    let outcome = match build_result {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            let _ = remove_directory_if_exists(&next_runtime);
+            return recover_after_update_failure(app, error).await;
+        }
+    };
+
+    if let UpdateOutcome::UpToDate { revision } = outcome {
+        // The service was stopped before the version check, so it has to come
+        // back up; nothing else changed.
+        let mut status = match start_service(app.clone()).await {
+            Ok(status) => status,
+            Err(error) => {
+                return Err(format!(
+                    "The checkout already matches origin/master ({revision}) but the Harness service failed to restart: {error}"
+                ))
+            }
+        };
+        status.message = "Harness is up to date".into();
+        status.detail = format!("The checkout already matches origin/master ({revision}).");
+        status.progress = 100;
+        status.progress_label = "Up to date".into();
+        publish_status(&app, status.clone());
+        emit_log(
+            &app,
+            "info",
+            format!("Harness is already at the latest revision ({revision}); nothing to rebuild."),
+        );
+        return Ok(status);
     }
 
     set_update_progress(
@@ -612,9 +885,7 @@ async fn perform_update(app: AppHandle) -> Result<HarnessStatus, String> {
         }
         Err(start_error) => {
             stop_service(&app);
-            if let Err(rollback_error) =
-                restore_previous_runtime(&active_runtime, &backup_runtime)
-            {
+            if let Err(rollback_error) = restore_previous_runtime(&active_runtime, &backup_runtime) {
                 return Err(format!(
                     "The updated runtime failed to start: {start_error}. Rollback also failed: {rollback_error}"
                 ));
@@ -638,7 +909,6 @@ async fn perform_update(app: AppHandle) -> Result<HarnessStatus, String> {
         }
     }
 }
-
 async fn prepare_deployed_runtime(
     app: &AppHandle,
     node: &Path,
@@ -720,96 +990,30 @@ async fn recover_after_update_failure(
     }
 }
 
-fn init_harness_dirs(app: &AppHandle) -> Result<(), String> {
-    let source = resource_path(app, "runtime/harness-source.zip")?;
-    let runtime = resource_path(app, "runtime/harness-runtime.zip")?;
-    let writable_root = writable_harness_root(app)?;
-    fs::create_dir_all(&writable_root)
-        .map_err(|error| format!("failed to create {}: {error}", writable_root.display()))?;
-
-    install_resource_archive(&source, &writable_root.join("source"), "source")?;
-    install_resource_archive(&runtime, &writable_root.join("runtime"), "runtime")?;
-    Ok(())
-}
-
-fn install_resource_archive(
-    archive_path: &Path,
-    destination: &Path,
-    name: &str,
-) -> Result<(), String> {
-    let marker = destination.join(".deepseek-harness-ready");
-    if marker.exists() {
-        return Ok(());
+/// Path of the Node.js runtime that executes the Harness CLI, the package
+/// manager, and the helper scripts. The sidecar copy installed next to the
+/// executable is the only one the bundle ships.
+fn bundled_node_path() -> Result<PathBuf, String> {
+    let mut executable = std::env::current_exe()
+        .map_err(|error| format!("failed to resolve the running executable: {error}"))?;
+    executable.set_file_name("node.exe");
+    if !executable.is_file() {
+        return Err(format!(
+            "the bundled Node.js runtime is missing at {}",
+            executable.display()
+        ));
     }
-
-    let parent = destination
-        .parent()
-        .ok_or_else(|| format!("invalid destination {}", destination.display()))?;
-    fs::create_dir_all(parent)
-        .map_err(|error| format!("failed to create {}: {error}", parent.display()))?;
-    let staging = parent.join(format!(".{name}-installing"));
-    remove_directory_if_exists(&staging)?;
-    extract_zip(archive_path, &staging)
-        .map_err(|error| format!("failed to extract bundled {name}: {error}"))?;
-    fs::write(&staging.join(".deepseek-harness-ready"), b"ready\n")
-        .map_err(|error| format!("failed to write {name} marker: {error}"))?;
-    remove_directory_if_exists(destination)?;
-    fs::rename(&staging, destination).map_err(|error| {
-        format!(
-            "failed to activate bundled {name} at {}: {error}",
-            destination.display()
-        )
-    })
+    Ok(executable)
 }
 
-fn extract_zip(archive_path: &Path, destination: &Path) -> Result<(), String> {
-    let file = fs::File::open(archive_path)
-        .map_err(|error| format!("failed to open {}: {error}", archive_path.display()))?;
-    let mut archive = zip::ZipArchive::new(file)
-        .map_err(|error| format!("failed to read {}: {error}", archive_path.display()))?;
-    for index in 0..archive.len() {
-        let mut entry = archive
-            .by_index(index)
-            .map_err(|error| format!("failed to read ZIP entry {index}: {error}"))?;
-        let Some(relative) = entry.enclosed_name() else {
-            continue;
-        };
-        let output = destination.join(relative);
-        if entry.is_dir() {
-            fs::create_dir_all(&output)
-                .map_err(|error| format!("failed to create {}: {error}", output.display()))?;
-            continue;
-        }
-        if let Some(parent) = output.parent() {
-            fs::create_dir_all(parent)
-                .map_err(|error| format!("failed to create {}: {error}", parent.display()))?;
-        }
-        let mut output_file = fs::File::create(&output)
-            .map_err(|error| format!("failed to create {}: {error}", output.display()))?;
-        std::io::copy(&mut entry, &mut output_file)
-            .map_err(|error| format!("failed to extract {}: {error}", output.display()))?;
-    }
-    Ok(())
+fn runtime_entry_path(runtime_dir: &Path) -> PathBuf {
+    runtime_dir
+        .join("node_modules")
+        .join("@deepseek-ai")
+        .join("dsh")
+        .join("lib")
+        .join("bin.js")
 }
-
-fn repair_source_checkout(app: &AppHandle) -> Result<(), String> {
-    let source = resource_path(app, "runtime/harness-source.zip")?;
-    let destination = writable_source_dir(app)?;
-    remove_directory_if_exists(&destination)?;
-    extract_zip(&source, &destination)?;
-    Ok(())
-}
-
-fn ensure_update_checkout(app: &AppHandle, source_dir: &Path) -> Result<(), String> {
-    if !source_dir.exists() || !source_dir.join("package.json").exists() {
-        repair_source_checkout(app)?;
-    }
-    if !source_dir.join(".git").exists() {
-        repair_source_checkout(app)?;
-    }
-    Ok(())
-}
-
 async fn run_pnpm(
     app: &AppHandle,
     node: &Path,
@@ -838,6 +1042,7 @@ async fn run_pnpm(
         label,
     )
     .await
+    .map(|_| ())
 }
 
 async fn run_pnpm_with_registry_fallback(
@@ -918,6 +1123,7 @@ async fn run_pnpm_with_registry(
         label,
     )
     .await
+    .map(|_| ())
 }
 
 fn pnpm_command_args(pnpm: &Path, args: Vec<String>) -> Vec<String> {
@@ -941,6 +1147,9 @@ fn pnpm_registry_command_args(
     command_args
 }
 
+/// Runs a helper program to completion and returns its captured stdout (ANSI
+/// escapes stripped, trailing whitespace trimmed). Callers that only care about
+/// success can ignore the value.
 async fn run_command(
     app: &AppHandle,
     program: &Path,
@@ -948,7 +1157,7 @@ async fn run_command(
     cwd: &Path,
     environment: Vec<(OsString, String)>,
     label: &str,
-) -> Result<(), String> {
+) -> Result<String, String> {
     // Tauri resource paths are verbatim on Windows (`\\?\D:\...`). pnpm
     // miscomputes lifecycle paths such as npm_execpath for that form.
     let program = normalize_windows_path(program);
@@ -1065,15 +1274,17 @@ async fn run_command(
     let _ = stdout_task.await;
     let _ = stderr_task.await;
     if status.success() {
+        let stdout_tail = command_output_text(&stdout_output);
         write_update_log(
             app,
             "info",
             format!(
-                "Finished {label} successfully\n  command: {command_line}\n  exitCode: {}",
-                status.code().map_or("unknown".into(), |code| code.to_string())
+                "Finished {label} successfully\n  command: {command_line}\n  exitCode: {}\n  stdout tail:\n{}",
+                status.code().map_or("unknown".into(), |code| code.to_string()),
+                indent_log_block(&stdout_tail),
             ),
         );
-        Ok(())
+        Ok(stdout_tail.trim().to_string())
     } else {
         let message = format!(
             "{label} failed with {}",
@@ -1223,9 +1434,10 @@ fn stop_service(app: &AppHandle) {
         .expect("authenticated URL lock poisoned") = None;
 
     if let Some(child) = child {
-        let pid = child.pid();
-        emit_log(app, "info", format!("Stopping Harness process {pid}"));
-        kill_process_tree(pid);
+        if let Some(pid) = child.id() {
+            emit_log(app, "info", format!("Stopping Harness process {pid}"));
+            kill_process_tree(pid);
+        }
         drop(child);
         if generation > 0 {
             let state = app.state::<AppState>();
@@ -1265,6 +1477,10 @@ fn extract_authenticated_url(line: &str, port: u16) -> Option<String> {
     None
 }
 
+/// Terminates a service process and everything it spawned.
+///
+/// The service is started directly through `std::process::Command`, so there is
+/// no sidecar handle to kill; the tree is torn down by PID instead.
 fn kill_process_tree(pid: u32) {
     #[cfg(windows)]
     {
@@ -1922,6 +2138,42 @@ fn set_phase(
     );
 }
 
+/// Picks the status presentation for a build step: the first run is an
+/// initialization, an update is an update.
+fn report_build_progress(
+    app: &AppHandle,
+    installing: bool,
+    progress: u8,
+    label: &str,
+    detail: &str,
+) {
+    if installing {
+        set_install_progress(app, progress, label, detail);
+    } else {
+        set_update_progress(app, progress, label, detail);
+    }
+}
+/// Progress for the first-run download and build. It stays in the
+/// `initializing` state so the window keeps showing the setup progress instead
+/// of switching to the update presentation, which would also disable the very
+/// controls a stuck user needs.
+fn set_install_progress(app: &AppHandle, progress: u8, label: &str, detail: &str) {
+    emit_log(app, "info", format!("{label} ({progress}%): {detail}"));
+    publish_status(
+        app,
+        HarnessStatus {
+            revision: 0,
+            state: "initializing".into(),
+            message: "Preparing the first-run environment".into(),
+            detail: detail.into(),
+            port: None,
+            url: None,
+            progress,
+            progress_label: label.into(),
+            update_in_progress: false,
+        },
+    );
+}
 fn set_update_progress(app: &AppHandle, progress: u8, label: &str, detail: &str) {
     let current = current_status(app);
     emit_log(
@@ -2017,9 +2269,92 @@ mod tests {
     use super::{
         extract_authenticated_url, normalize_path_for_command, normalize_windows_path,
         pnpm_command_args, pnpm_registry_command_args, progress_frames, prune_session_cookies,
-        redact_secrets, redact_url_password, sanitize_log_line, MAX_LOG_LINE_CHARS,
+        read_package_version, redact_secrets, redact_url_password, runtime_entry_path,
+        sanitize_log_line, short_revision, source_is_installed, runtime_is_installed,
+        update_needs_rebuild, MAX_LOG_LINE_CHARS,
     };
     use std::path::Path;
+
+    #[test]
+    fn skips_the_rebuild_only_for_an_identical_revision() {
+        assert!(!update_needs_rebuild("abc123", "abc123", false));
+        assert!(update_needs_rebuild("abc123", "def456", false));
+        assert!(update_needs_rebuild("abc123", "abc123", true));
+        // Unknown revisions must never be treated as "already up to date".
+        assert!(update_needs_rebuild("", "abc123", false));
+        assert!(update_needs_rebuild("abc123", "", false));
+    }
+
+    #[test]
+    fn shortens_git_object_names_for_display() {
+        assert_eq!(short_revision("0d1f50007f9bca3f52b06e1c3074fa14d5fb0720"), "0d1f500");
+        assert_eq!(short_revision("abc"), "abc");
+        assert_eq!(short_revision(""), "");
+    }
+    fn temp_dir(label: &str) -> std::path::PathBuf {
+        let path = std::env::temp_dir().join(format!("dsh-{label}-{}", std::process::id()));
+        std::fs::remove_dir_all(&path).ok();
+        std::fs::create_dir_all(&path).unwrap();
+        path
+    }
+
+    #[test]
+    fn detects_installed_source_and_runtime_directories() {
+        let root = temp_dir("installed-probe");
+        let source = root.join("source");
+        let runtime = root.join("runtime");
+
+        assert!(!source_is_installed(&source));
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::write(source.join("package.json"), "{}").unwrap();
+        assert!(!source_is_installed(&source), "a checkout needs Git metadata");
+        std::fs::create_dir_all(source.join(".git")).unwrap();
+        assert!(source_is_installed(&source));
+
+        assert!(!runtime_is_installed(&runtime));
+        std::fs::create_dir_all(runtime.join("node_modules/@deepseek-ai/dsh/lib")).unwrap();
+        std::fs::write(runtime.join("package.json"), "{}").unwrap();
+        assert!(!runtime_is_installed(&runtime), "the CLI entry point is required");
+        std::fs::write(runtime_entry_path(&runtime), "// entry").unwrap();
+        assert!(runtime_is_installed(&runtime));
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn resolves_the_runtime_entry_point_inside_a_deployment() {
+        let runtime = Path::new("C:/dsh/runtime");
+        assert_eq!(
+            runtime_entry_path(runtime),
+            runtime
+                .join("node_modules")
+                .join("@deepseek-ai")
+                .join("dsh")
+                .join("lib")
+                .join("bin.js")
+        );
+    }
+    #[test]
+    fn reads_harness_version_from_package_manifest() {
+        let directory = std::env::temp_dir().join(format!("dsh-version-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let manifest = directory.join("package.json");
+        std::fs::write(
+            &manifest,
+            r#"{ "name": "@deepseek-ai/dsh", "version": "0.1.6-alpha.1" }"#,
+        )
+        .unwrap();
+        assert_eq!(
+            read_package_version(&manifest).as_deref(),
+            Some("0.1.6-alpha.1")
+        );
+
+        std::fs::write(&manifest, r#"{ "version": "" }"#).unwrap();
+        assert_eq!(read_package_version(&manifest), None);
+        assert_eq!(read_package_version(&directory.join("missing.json")), None);
+
+        std::fs::remove_dir_all(&directory).ok();
+    }
 
     #[test]
     fn extracts_harness_launch_url() {

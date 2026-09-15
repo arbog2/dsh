@@ -3,6 +3,7 @@ import { listen } from "@tauri-apps/api/event";
 import {
   createIcons,
   FolderOpen,
+  Hammer,
   Languages,
   PanelTop,
   RefreshCw,
@@ -54,6 +55,10 @@ const translations: Record<Language, Record<string, string>> = {
     stateStopping: "Stopping",
     stateError: "Error",
     unavailable: "Harness is unavailable",
+    versionLabel: "Version:",
+    forceUpdate: "Force rebuild",
+    statusChecking: "Checking the local runtime",
+    statusCheckingDetail: "Verifying the bundled Harness files.",
   },
   zh: {
     open: "打开 Harness",
@@ -78,13 +83,21 @@ const translations: Record<Language, Record<string, string>> = {
     stateStopping: "停止中",
     stateError: "错误",
     unavailable: "Harness 当前不可用",
+    versionLabel: "版本号：",
+    forceUpdate: "强制重新构建",
+    statusChecking: "正在检查本地运行环境",
+    statusCheckingDetail: "正在校验内置的 Harness 文件。",
   },
 };
 
 const chinesePhrases: Record<string, string> = {
-  "Preparing the local runtime": "正在准备本地运行环境",
-  "The first launch can take a moment while files are prepared.":
-    "首次启动需要准备运行时文件，请稍候。",
+  "Checking the local runtime": "正在检查本地运行环境",
+  "Verifying the bundled Harness files.": "正在校验内置的 Harness 文件。",
+  "Preparing the first-run environment": "正在准备首次运行环境",
+  "Downloading the latest Harness source from GitHub. This only happens once.":
+    "正在从 GitHub 下载最新的 Harness 源码，仅需执行一次。",
+  "Cloning the Harness source repository.": "正在克隆 Harness 源码仓库。",
+  "git clone": "克隆源码仓库",
   "Starting Harness": "正在启动 Harness",
   "Launching the bundled Node.js service.": "正在启动内置 Node.js 服务。",
   "Waiting for the Web service": "正在等待 Web 服务",
@@ -110,6 +123,9 @@ const chinesePhrases: Record<string, string> = {
   "Activating runtime": "启用新运行时",
   "Switching to the newly built Harness release.": "正在切换到新构建的 Harness 版本。",
   "Harness updated": "Harness 已更新",
+  "Harness is up to date": "Harness 已是最新版本",
+  "Up to date": "已是最新",
+
   "The latest revision is running.": "最新版本正在运行。",
   Updated: "已更新",
   "Update failed": "更新失败",
@@ -126,6 +142,10 @@ const chinesePhrases: Record<string, string> = {
 };
 
 const chinesePrefixes: Array<[string, string]> = [
+  [
+    "The checkout already matches origin/master",
+    "本地代码已与 origin/master 一致",
+  ],
   ["Update failed and the previous version was restored:", "更新失败，已恢复上一版本："],
   ["Update failed:", "更新失败："],
   ["Harness is ready at ", "Harness 已就绪："],
@@ -149,6 +169,9 @@ const elements = {
   languageButton: requiredButton("language-button"),
   openLogsButton: requiredButton("open-logs-button"),
   clearLogButton: requiredButton("clear-log-button"),
+  forceUpdateButton: requiredButton("force-update-button"),
+  versionBadge: requiredElement("version-badge"),
+  versionValue: requiredElement("version-value"),
 };
 
 const logHistory: LogEvent[] = [];
@@ -159,8 +182,8 @@ let harnessReady = false;
 let currentStatus: HarnessStatus = {
   revision: -1,
   state: "initializing",
-  message: "Preparing the local runtime",
-  detail: "The first launch can take a moment while files are prepared.",
+  message: "Checking the local runtime",
+  detail: "Verifying the bundled Harness files.",
   port: null,
   url: null,
   progress: 0,
@@ -169,7 +192,7 @@ let currentStatus: HarnessStatus = {
 };
 
 createIcons({
-  icons: { FolderOpen, Languages, PanelTop, RefreshCw, RotateCw, Trash2 },
+  icons: { FolderOpen, Hammer, Languages, PanelTop, RefreshCw, RotateCw, Trash2 },
   attrs: { "stroke-width": "1.8" },
 });
 
@@ -184,7 +207,12 @@ elements.restartButton.addEventListener("click", () => {
 
 elements.updateButton.addEventListener("click", () => {
   setDrawer(true);
-  void runAction("update_harness");
+  void runUpdate(false);
+});
+
+elements.forceUpdateButton.addEventListener("click", () => {
+  setDrawer(true);
+  void runUpdate(true);
 });
 
 elements.languageButton.addEventListener("click", () => {
@@ -206,6 +234,7 @@ elements.clearLogButton.addEventListener("click", () => {
 
 applyLanguage();
 setDrawer(true, true);
+void refreshHarnessVersion();
 
 void initializeStatusStream().catch((error: unknown) => {
   renderError(error);
@@ -223,12 +252,35 @@ async function initializeStatusStream(): Promise<void> {
   renderStatus(await invoke<HarnessStatus>("get_status"));
 }
 
+/// `force` rebuilds even when the checkout already matches origin/master, which
+/// is the escape hatch for a runtime that was damaged locally.
+async function runUpdate(force: boolean): Promise<void> {
+  try {
+    const status = await invoke<HarnessStatus>("update_harness", { force });
+    renderStatus(status);
+  } catch (error: unknown) {
+    renderError(error);
+  }
+}
+
 async function runAction(command: string): Promise<void> {
   try {
     const status = await invoke<HarnessStatus>(command);
     renderStatus(status);
   } catch (error: unknown) {
     renderError(error);
+  }
+}
+
+async function refreshHarnessVersion(): Promise<void> {
+  try {
+    const version = await invoke<string>("get_harness_version");
+    const normalized = version.trim().replace(/^v/u, "");
+    if (!normalized) return;
+    elements.versionValue.textContent = `v${normalized}`;
+    elements.versionBadge.hidden = false;
+  } catch {
+    // The runtime is not installed yet, so keep the badge hidden.
   }
 }
 
@@ -254,6 +306,7 @@ function renderStatus(status: HarnessStatus): void {
   elements.drawerButton.disabled = !running && status.state !== "updating" && status.state !== "error";
   elements.restartButton.disabled = !running || busy || status.state === "starting" || status.state === "initializing";
   elements.updateButton.disabled = busy;
+  elements.forceUpdateButton.disabled = busy;
 
   if (running) {
     const wasRecovering =
@@ -266,6 +319,11 @@ function renderStatus(status: HarnessStatus): void {
       setDrawer(false);
     } else if (wasRecovering) {
       setDrawer(false);
+    }
+    if (wasRecovering || elements.versionBadge.hidden) {
+      // The runtime appears after the first extraction, and an update can swap
+      // in a different Harness release.
+      void refreshHarnessVersion();
     }
   } else if (
     status.state === "updating" ||

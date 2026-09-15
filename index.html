@@ -11,8 +11,14 @@
       <header class="topbar">
         <div class="brand">
           <div class="brand-mark" aria-hidden="true">DS</div>
-          <div>
-            <h1>DeepSeek Harness</h1>
+          <div class="brand-text">
+            <div class="title-row">
+              <h1>DeepSeek Harness</h1>
+              <span id="version-badge" class="version-badge" hidden>
+                <span class="version-label" data-i18n="versionLabel">Version:</span>
+                <span id="version-value" class="version-value"></span>
+              </span>
+            </div>
             <div class="service-line">
               <span id="status-dot" class="status-dot neutral"></span>
               <span id="status-label">Starting</span>
@@ -54,6 +60,16 @@
             <span class="sr-only" data-i18n="update">Update</span>
           </button>
           <button
+            id="force-update-button"
+            class="icon-button topbar-icon"
+            type="button"
+            title="Force rebuild"
+            data-i18n-title="forceUpdate"
+          >
+            <i data-lucide="hammer" aria-hidden="true"></i>
+            <span class="sr-only" data-i18n="forceUpdate">Force rebuild</span>
+          </button>
+          <button
             id="language-button"
             class="button secondary language-button"
             type="button"
@@ -70,8 +86,8 @@
         <section class="status-panel" aria-live="polite">
           <div class="status-copy">
             <p class="eyebrow" data-i18n="service">Service</p>
-            <h2 id="status-message">Preparing the local runtime</h2>
-            <p id="status-detail">The first launch can take a moment while files are prepared.</p>
+            <h2 id="status-message" data-i18n="statusChecking">Checking the local runtime</h2>
+            <p id="status-detail" data-i18n="statusCheckingDetail">Verifying the bundled Harness files.</p>
           </div>
           <div class="progress-block">
             <div class="progress-meta">
@@ -100,6 +116,7 @@
               <h2 data-i18n="runtimeLog">Runtime log</h2>
             </div>
             <div class="panel-actions">
+
               <button
                 id="open-logs-button"
                 class="icon-button"
