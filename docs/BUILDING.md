@@ -48,6 +48,60 @@ MinGit 和修复脚本。
 
 如果下载源不可访问，脚本会尝试备用镜像。
 
+## 代码托管与镜像发布
+
+同一份历史发布在两个远端：
+
+| 远端 | 地址 | 说明 |
+| --- | --- | --- |
+| `origin` | `https://github.com/arbog2/dsh.git` | 主仓库 |
+| `gitee` | `https://gitee.com/arbog/dsh.git` | 国内镜像 |
+
+两个远端的 `main` 指向同一个提交，工作树内容逐文件一致。仓库里唯一的镜像专用
+改动是 `LICENSE`（木兰宽松许可证 v2）：它由 `2a622ab` 引入，并通过合并提交
+`839777f` 并入主分支，从而在保留该提交的同时让两个远端合流。
+
+```powershell
+git push origin main
+git push gitee main
+git push origin --tags
+git push gitee --tags
+```
+
+### Gitee Release 附件
+
+Gitee 的单个 Release 附件上限为 100 MB，因此便携包拆成三个分卷：
+
+```text
+DeepSeekHarness-portable-x64.zip.part1of3
+DeepSeekHarness-portable-x64.zip.part2of3
+DeepSeekHarness-portable-x64.zip.part3of3
+```
+
+按 30 MiB 固定长度顺序切分，合并顺序即文件名顺序：
+
+```powershell
+cmd /c copy /b DeepSeekHarness-portable-x64.zip.part1of3+DeepSeekHarness-portable-x64.zip.part2of3+DeepSeekHarness-portable-x64.zip.part3of3 DeepSeekHarness-portable-x64.zip
+Get-FileHash .\DeepSeekHarness-portable-x64.zip -Algorithm SHA256
+```
+
+合并结果必须与 GitHub Release 上的整包 SHA-256 一致。以 v0.1.7 为例：
+
+```text
+A243E92A1D7055DA659C4C987472EA1AAB415D742D7BE5361095BFC8D21F343B  zip
+1E3A5003E2A6AF83DD5F16FD1184307B71FC021D320BBE73699CE893C611B928  part1of3
+AFBE71C2023DC7FB94D24CE2552585AFF708020FF349E519F2D89E1B52FC1FBE  part2of3
+0960F21C84D6D93030E7D22F538D6CC25BAFCD4F2D9B1C216897FDF3B23862AE  part3of3
+```
+
+上传用 Gitee OpenAPI v5，token 必须放在查询串里；放进表单会返回 401：
+
+```powershell
+curl.exe -X POST "https://gitee.com/api/v5/repos/arbog/dsh/releases/<release_id>/attach_files?access_token=<token>" -F "file=@DeepSeekHarness-portable-x64.zip.part1of3"
+```
+
+Release 正文同样记录整包与分卷的 SHA-256。
+
 ## 开发
 
 ```powershell
