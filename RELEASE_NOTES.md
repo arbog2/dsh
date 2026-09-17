@@ -7,6 +7,11 @@
 - **便携包体积从 238 MiB 降到 78.6 MiB。** 包内只保留 Node.js、pnpm、MinGit 和
   运行时修复脚本；`harness-source.zip`、`harness-runtime.zip` 以及重复的
   `runtime\node\node.exe` 不再打包。
+- **Harness 进程树放进 Windows Job Object**（`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`）。
+  句柄随 `DeepSeekHarness.exe` 消失而关闭，内核随即终止 job 内的全部进程，因此
+  任务管理器强杀、程序崩溃、注销和断电都不会留下 `node.exe`。Job Object 创建或
+  分配失败时（日志中会出现 `Could not place the Harness process in a job object`
+  警告）才会退回按 PID 清理。
 - **首次启动改为联网构建。** 程序用内置 MinGit 克隆上游 `master`，再执行
   `pnpm install` / `clean` / `build` / `deploy`，通常 5–15 分钟。后续启动复用结果，
   只需几秒。
@@ -27,7 +32,7 @@
 - 顶部控制栏和可展开的状态/日志抽屉。
 - 中英文即时切换。
 - 一键更新 Harness，失败自动恢复上一个可用运行时。
-- 关闭窗口时清理完整 Node.js 进程树。
+- 关闭窗口时清理完整 Node.js 进程树；异常退出由 Job Object 兜底。
 
 ## 系统要求
 
