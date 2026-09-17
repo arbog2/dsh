@@ -102,7 +102,8 @@ node <runtime>\node_modules\@deepseek-ai\dsh\lib\bin.js web --port <port> --no-o
 
 ## 进程生命周期
 
-Node.js 子进程的 PID 保存在 Tauri 状态中。
+Node.js 子进程的 PID 保存在 Tauri 状态中，同时被放进一个 Windows Job Object
+（`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`）。
 
 窗口关闭事件执行：
 
@@ -110,8 +111,13 @@ Node.js 子进程的 PID 保存在 Tauri 状态中。
 taskkill /PID <pid> /T /F
 ```
 
-使用 `/T` 会终止 Node.js 创建的全部子进程。应用退出事件也会再次执行清理，防止
-窗口事件被绕过。
+使用 `/T` 会终止 Node.js 创建的全部子进程。之后还会清空 Job Object，用于回收
+父进程已经退出、`/T` 无法遍历到的进程。应用退出事件也会再次执行清理，防止窗口
+事件被绕过。
+
+Job Object 是最后一道保险：句柄随桌面进程消失而关闭，内核于是终止 job 内的全部
+进程，所以任务管理器强杀、程序崩溃、注销和断电都不会留下 `node.exe`。创建或分配
+失败时（日志会记录警告）只剩按 PID 清理这一条路径。
 
 ## 状态同步
 

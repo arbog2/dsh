@@ -239,8 +239,14 @@ SHA-256。
 taskkill /PID <pid> /T /F
 ```
 
-如果系统强制终止进程或断电，可能留下进程。可在任务管理器结束
-`DeepSeekHarness.exe` 和对应的 `node.exe`。
+Harness 服务进程树同时被放进一个 Windows Job Object
+（`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`）。句柄随 `DeepSeekHarness.exe` 消失而
+关闭，内核随即终止 job 内的全部进程，因此任务管理器强杀、程序崩溃、注销和断电
+也不会留下 `node.exe`。
+
+只有当 Job Object 创建或分配失败时（日志中会出现 `Could not place the Harness
+process in a job object` 警告），才会退回按 PID 清理这一条路径；此时强制结束进程
+仍可能留下 `node.exe`，可在任务管理器手动结束。
 
 ### 更新失败
 

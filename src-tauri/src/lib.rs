@@ -70,6 +70,11 @@ struct AppState {
     diagnostics: Mutex<Option<DiagnosticLogState>>,
     generation: AtomicU64,
     update_in_progress: AtomicBool,
+    /// Owns the job object that holds the Harness service tree. The kernel kills
+    /// everything inside it when this handle closes, so exits that never reach
+    /// the shutdown handlers leave no process behind.
+    #[cfg(windows)]
+    service_job: Mutex<Option<service_job::ServiceJob>>,
 }
 
 struct DiagnosticLogState {
@@ -367,6 +372,16 @@ async fn start_service(app: AppHandle) -> Result<HarnessStatus, String> {
     let pid = child
         .id()
         .ok_or_else(|| "the Harness process exited before it could be tracked".to_string())?;
+    // Join the job object as early as possible: processes the service spawns
+    // before this call would not inherit the membership.
+    #[cfg(windows)]
+    if !assign_to_service_job(&app, pid) {
+        emit_log(
+            &app,
+            "warn",
+            "Could not place the Harness process in a job object; cleanup falls back to killing the tree by PID.",
+        );
+    }
     let stdout = child
         .stdout
         .take()
@@ -1450,6 +1465,12 @@ fn stop_service(app: &AppHandle) {
             }
         }
     }
+
+    // The PID walk above is skipped whenever the tracked process was already
+    // reaped, so sweep the job as well to collect whatever the service left
+    // behind.
+    #[cfg(windows)]
+    stop_service_job(app);
 }
 
 fn extract_authenticated_url(line: &str, port: u16) -> Option<String> {
@@ -1477,6 +1498,232 @@ fn extract_authenticated_url(line: &str, port: u16) -> Option<String> {
     None
 }
 
+/// Holds the Harness service inside a Windows job object.
+///
+/// The service is an ordinary child process, so Windows keeps it running when
+/// this process disappears without running its shutdown handlers: a Task
+/// Manager kill, a crash, a logoff, or a power loss all skip `stop_service`.
+/// Every process the service spawns inherits the job, and
+/// `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` makes the kernel tear the whole tree
+/// down as soon as the last handle to the job closes - which is exactly what
+/// happens when this process stops existing, however abruptly.
+#[cfg(windows)]
+mod service_job {
+    use std::{ffi::c_void, mem, ptr};
+
+    /// `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`.
+    const KILL_ON_JOB_CLOSE: u32 = 0x0000_2000;
+    /// `JobObjectExtendedLimitInformation`.
+    const EXTENDED_LIMIT_INFORMATION_CLASS: i32 = 9;
+    /// `PROCESS_TERMINATE | PROCESS_SET_QUOTA`, the access
+    /// `AssignProcessToJobObject` requires.
+    const ASSIGN_ACCESS: u32 = 0x0001 | 0x0100;
+
+    #[repr(C)]
+    struct JobObjectBasicLimitInformation {
+        per_process_user_time_limit: i64,
+        per_job_user_time_limit: i64,
+        limit_flags: u32,
+        minimum_working_set_size: usize,
+        maximum_working_set_size: usize,
+        active_process_limit: u32,
+        affinity: usize,
+        priority_class: u32,
+        scheduling_class: u32,
+    }
+
+    #[repr(C)]
+    struct IoCounters {
+        read_operation_count: u64,
+        write_operation_count: u64,
+        other_operation_count: u64,
+        read_transfer_count: u64,
+        write_transfer_count: u64,
+        other_transfer_count: u64,
+    }
+
+    #[repr(C)]
+    struct JobObjectExtendedLimitInformation {
+        basic_limit_information: JobObjectBasicLimitInformation,
+        io_info: IoCounters,
+        process_memory_limit: usize,
+        job_memory_limit: usize,
+        peak_process_memory_used: usize,
+        peak_job_memory_used: usize,
+    }
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn CreateJobObjectW(attributes: *mut c_void, name: *const u16) -> *mut c_void;
+        fn SetInformationJobObject(
+            job: *mut c_void,
+            information_class: i32,
+            information: *mut c_void,
+            information_length: u32,
+        ) -> i32;
+        fn AssignProcessToJobObject(job: *mut c_void, process: *mut c_void) -> i32;
+        fn TerminateJobObject(job: *mut c_void, exit_code: u32) -> i32;
+        fn OpenProcess(desired_access: u32, inherit_handle: i32, process_id: u32) -> *mut c_void;
+        fn CloseHandle(object: *mut c_void) -> i32;
+    }
+
+    pub(crate) struct ServiceJob {
+        handle: *mut c_void,
+    }
+
+    // A job handle is a reference to a kernel object, not a thread-bound
+    // resource, so it may be shared across the runtime's worker threads.
+    unsafe impl Send for ServiceJob {}
+    unsafe impl Sync for ServiceJob {}
+
+    impl ServiceJob {
+        /// Creates the job with kill-on-close armed. `None` means the caller
+        /// has to fall back to killing the tree by PID.
+        pub(crate) fn new() -> Option<Self> {
+            let handle = unsafe { CreateJobObjectW(ptr::null_mut(), ptr::null()) };
+            if handle.is_null() {
+                return None;
+            }
+            let mut limits: JobObjectExtendedLimitInformation = unsafe { mem::zeroed() };
+            limits.basic_limit_information.limit_flags = KILL_ON_JOB_CLOSE;
+            let configured = unsafe {
+                SetInformationJobObject(
+                    handle,
+                    EXTENDED_LIMIT_INFORMATION_CLASS,
+                    (&mut limits as *mut JobObjectExtendedLimitInformation).cast(),
+                    mem::size_of::<JobObjectExtendedLimitInformation>() as u32,
+                )
+            };
+            if configured == 0 {
+                unsafe { CloseHandle(handle) };
+                return None;
+            }
+            Some(Self { handle })
+        }
+
+        /// Moves `pid` into the job so that everything it spawns later
+        /// inherits the membership.
+        pub(crate) fn assign(&self, pid: u32) -> bool {
+            let process = unsafe { OpenProcess(ASSIGN_ACCESS, 0, pid) };
+            if process.is_null() {
+                return false;
+            }
+            let assigned = unsafe { AssignProcessToJobObject(self.handle, process) } != 0;
+            unsafe { CloseHandle(process) };
+            assigned
+        }
+
+        /// Kills every process still inside the job.
+        pub(crate) fn terminate(&self) -> bool {
+            let terminated = unsafe { TerminateJobObject(self.handle, 0) };
+            terminated != 0
+        }
+    }
+
+    impl Drop for ServiceJob {
+        fn drop(&mut self) {
+            // Closing the last handle is what triggers the kill-on-close rule.
+            unsafe { CloseHandle(self.handle) };
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use std::{
+            process::{Child, Command, Stdio},
+            thread,
+            time::{Duration, Instant},
+        };
+
+        /// A process that stays alive for long enough that only the job can end
+        /// it inside the test's timeout.
+        fn spawn_idle_child() -> Child {
+            Command::new("cmd.exe")
+                .args(["/C", "ping -n 30 127.0.0.1 > NUL"])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("failed to spawn the test child")
+        }
+
+        fn wait_for_exit(child: &mut Child) -> bool {
+            let deadline = Instant::now() + Duration::from_secs(15);
+            loop {
+                match child.try_wait() {
+                    Ok(Some(_)) => return true,
+                    Ok(None) if Instant::now() < deadline => {
+                        thread::sleep(Duration::from_millis(50));
+                    }
+                    Ok(None) | Err(_) => {
+                        let _ = child.kill();
+                        return false;
+                    }
+                }
+            }
+        }
+
+        #[test]
+        #[cfg(target_pointer_width = "64")]
+        fn matches_the_documented_windows_layout() {
+            assert_eq!(mem::size_of::<JobObjectExtendedLimitInformation>(), 144);
+        }
+
+        /// The guarantee the desktop shell relies on: once this process is
+        /// gone, nothing it started keeps running.
+        #[test]
+        fn kills_the_tree_when_the_last_handle_closes() {
+            let mut child = spawn_idle_child();
+            let job = ServiceJob::new().expect("failed to create the test job");
+            assert!(job.assign(child.id()), "failed to move the child into the job");
+            // The child has to be alive when the job closes, otherwise the
+            // assertion below would pass for the wrong reason.
+            assert!(
+                matches!(child.try_wait(), Ok(None)),
+                "the test child exited before the job was closed"
+            );
+
+            // Dropping the job closes the last handle, exactly like this
+            // process disappearing does.
+            drop(job);
+
+            assert!(
+                wait_for_exit(&mut child),
+                "the job holder exited but its child kept running"
+            );
+        }
+
+        /// Restarts and updates sweep the job and then put the next service
+        /// process into it, so the job has to survive `TerminateJobObject`.
+        #[test]
+        fn stays_usable_after_a_terminate() {
+            let job = ServiceJob::new().expect("failed to create the test job");
+
+            let mut stopped = spawn_idle_child();
+            assert!(job.assign(stopped.id()), "failed to move the first child in");
+            assert!(job.terminate(), "failed to terminate the job");
+            assert!(
+                wait_for_exit(&mut stopped),
+                "the first child survived the sweep"
+            );
+
+            let mut reused = spawn_idle_child();
+            assert!(job.assign(reused.id()), "failed to move the second child in");
+            assert!(
+                matches!(reused.try_wait(), Ok(None)),
+                "the second child died with the swept job"
+            );
+
+            drop(job);
+            assert!(
+                wait_for_exit(&mut reused),
+                "the second child survived the handle closing"
+            );
+        }
+    }
+}
+
 /// Terminates a service process and everything it spawned.
 ///
 /// The service is started directly through `std::process::Command`, so there is
@@ -1496,6 +1743,41 @@ fn kill_process_tree(pid: u32) {
         let _ = Command::new("kill")
             .args(["-9", &pid.to_string()])
             .output();
+    }
+}
+
+/// Moves a freshly spawned service process into the job object, creating the
+/// job on first use.
+///
+/// A `false` return only means this process is covered by the PID-based
+/// cleanup alone, which is the behaviour shipped before job objects were used.
+#[cfg(windows)]
+fn assign_to_service_job(app: &AppHandle, pid: u32) -> bool {
+    let state = app.state::<AppState>();
+    let mut job = state
+        .service_job
+        .lock()
+        .expect("service job lock poisoned");
+    if job.is_none() {
+        *job = service_job::ServiceJob::new();
+    }
+    job.as_ref().map(|job| job.assign(pid)).unwrap_or(false)
+}
+
+/// Kills whatever is still inside the job object.
+///
+/// This reaches the processes a PID walk cannot: children whose parent already
+/// exited, and trees whose tracked root was reaped before the shutdown handler
+/// ran. The job survives the sweep and takes the next service process.
+#[cfg(windows)]
+fn stop_service_job(app: &AppHandle) {
+    let state = app.state::<AppState>();
+    let job = state
+        .service_job
+        .lock()
+        .expect("service job lock poisoned");
+    if let Some(job) = job.as_ref() {
+        job.terminate();
     }
 }
 
